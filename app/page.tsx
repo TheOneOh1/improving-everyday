@@ -1,6 +1,6 @@
 "use client";
 
-import React from "react";
+import React, { useState } from "react";
 import Link from "next/link";
 import { motion } from "framer-motion";
 import {
@@ -18,6 +18,10 @@ import {
   ChevronRight,
   Trophy,
   Zap,
+  CheckSquare,
+  Square,
+  ExternalLink,
+  Check,
 } from "lucide-react";
 import { AppShell } from "@/components/layout/AppShell";
 import { Progress } from "@/components/ui/progress";
@@ -26,6 +30,7 @@ import { Button } from "@/components/ui/button";
 import { tracks, getTotalLessons, getTotalDuration } from "@/lib/content";
 import { useProgress } from "@/lib/hooks/useProgress";
 import { useProfile } from "@/lib/hooks/useProfile";
+import { useTasks } from "@/lib/hooks/useTasks";
 import { formatDuration, cn } from "@/lib/utils";
 
 const TRACK_ICONS: Record<string, React.ElementType> = {
@@ -166,6 +171,11 @@ function TrackCard({
 export default function DashboardPage() {
   const { activeProfile } = useProfile();
   const { getTrackProgress, getRecentlyCompleted } = useProgress(activeProfile?.id ?? null);
+  const { tasks, toggleTask } = useTasks(activeProfile?.id ?? null);
+  const [rightTab, setRightTab] = useState<"learning" | "tasks">("learning");
+
+  const pendingTasks = tasks.filter((t) => !t.completed);
+  const completedTasks = tasks.filter((t) => t.completed);
 
   const totalCompleted = tracks.reduce((sum, t) => {
     const total = getTotalLessons(t);
@@ -267,7 +277,7 @@ export default function DashboardPage() {
             <div className="lg:col-span-2">
               <div className="flex items-center justify-between mb-5">
                 <h2 className="text-sm font-semibold text-zinc-300">Learning Tracks</h2>
-                <span className="text-xs text-zinc-700">4 tracks · {totalLessons} lessons</span>
+                <span className="text-xs text-zinc-700">{tracks.length} tracks · {totalLessons} lessons</span>
               </div>
 
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 auto-rows-fr">
@@ -288,59 +298,159 @@ export default function DashboardPage() {
 
             {/* Right column */}
             <div className="space-y-5">
-              {/* Continue Learning */}
+              {/* Tabbed panel: Continue Learning + My Tasks */}
               <motion.div
                 initial={{ opacity: 0, x: 16 }}
                 animate={{ opacity: 1, x: 0 }}
                 transition={{ delay: 0.28, duration: 0.4 }}
-                className="rounded-2xl border border-zinc-800 bg-zinc-900/30 p-5"
+                className="rounded-2xl border border-zinc-800 bg-zinc-900/30 overflow-hidden"
               >
-                <h3 className="text-xs font-semibold text-zinc-400 uppercase tracking-widest mb-4 flex items-center gap-2">
-                  <Flame className="h-3.5 w-3.5 text-orange-400" />
-                  Continue Learning
-                </h3>
+                {/* Tab bar */}
+                <div className="flex border-b border-zinc-800">
+                  <button
+                    onClick={() => setRightTab("learning")}
+                    className={cn(
+                      "flex-1 flex items-center justify-center gap-1.5 py-3 text-xs font-medium transition-colors",
+                      rightTab === "learning"
+                        ? "text-orange-400 border-b-2 border-orange-500 -mb-px bg-zinc-900/40"
+                        : "text-zinc-500 hover:text-zinc-300"
+                    )}
+                  >
+                    <Flame className="h-3.5 w-3.5" />
+                    Continue Learning
+                  </button>
+                  <button
+                    onClick={() => setRightTab("tasks")}
+                    className={cn(
+                      "flex-1 flex items-center justify-center gap-1.5 py-3 text-xs font-medium transition-colors",
+                      rightTab === "tasks"
+                        ? "text-blue-400 border-b-2 border-blue-500 -mb-px bg-zinc-900/40"
+                        : "text-zinc-500 hover:text-zinc-300"
+                    )}
+                  >
+                    <CheckSquare className="h-3.5 w-3.5" />
+                    My Tasks
+                    {pendingTasks.length > 0 && (
+                      <span className={cn(
+                        "px-1.5 py-0.5 rounded-full text-[10px] font-semibold",
+                        rightTab === "tasks" ? "bg-blue-500/20 text-blue-400" : "bg-zinc-800 text-zinc-400"
+                      )}>
+                        {pendingTasks.length}
+                      </span>
+                    )}
+                  </button>
+                </div>
 
-                {inProgressTracks.length > 0 ? (
-                  <div className="space-y-2">
-                    {inProgressTracks.map((track) => {
-                      const Icon = TRACK_ICONS[track.id] || BookOpen;
-                      const total = getTotalLessons(track);
-                      const { percent, completed } = getTrackProgress(track.id, total);
-                      const firstLesson = track.modules[0]?.lessons[0];
+                <div className="p-4">
+                  {/* Continue Learning tab */}
+                  {rightTab === "learning" && (
+                    inProgressTracks.length > 0 ? (
+                      <div className="space-y-2">
+                        {inProgressTracks.map((track) => {
+                          const Icon = TRACK_ICONS[track.id] || BookOpen;
+                          const total = getTotalLessons(track);
+                          const { percent, completed } = getTrackProgress(track.id, total);
+                          const firstLesson = track.modules[0]?.lessons[0];
+                          return (
+                            <Link
+                              key={track.id}
+                              href={`/tracks/${track.id}/${track.modules[0]?.id}/${firstLesson?.id}`}
+                              className="flex items-center gap-3 p-3 rounded-xl hover:bg-zinc-800/60 transition-colors group border border-transparent hover:border-zinc-800"
+                            >
+                              <div
+                                className="h-8 w-8 rounded-lg flex items-center justify-center shrink-0"
+                                style={{ background: `${track.color}15`, border: `1px solid ${track.color}25` }}
+                              >
+                                <Icon className="h-4 w-4" style={{ color: track.color }} />
+                              </div>
+                              <div className="flex-1 min-w-0">
+                                <div className="flex items-center justify-between mb-1">
+                                  <p className="text-xs font-medium text-zinc-300 truncate">{track.title}</p>
+                                  <span className="text-[10px] text-zinc-600 ml-2 shrink-0">{percent}%</span>
+                                </div>
+                                <Progress value={percent} color={track.color} className="h-1" />
+                                <p className="text-[10px] text-zinc-600 mt-1">{completed}/{total} done</p>
+                              </div>
+                              <ChevronRight className="h-3.5 w-3.5 text-zinc-700 group-hover:text-zinc-400 transition-colors shrink-0" />
+                            </Link>
+                          );
+                        })}
+                      </div>
+                    ) : (
+                      <div className="text-center py-6 space-y-2">
+                        <BookOpen className="h-8 w-8 text-zinc-800 mx-auto" />
+                        <p className="text-xs text-zinc-600 leading-relaxed">
+                          Start a track below to see your in-progress courses here
+                        </p>
+                      </div>
+                    )
+                  )}
 
-                      return (
-                        <Link
-                          key={track.id}
-                          href={`/tracks/${track.id}/${track.modules[0]?.id}/${firstLesson?.id}`}
-                          className="flex items-center gap-3 p-3 rounded-xl hover:bg-zinc-800/60 transition-colors group border border-transparent hover:border-zinc-800"
-                        >
-                          <div
-                            className="h-8 w-8 rounded-lg flex items-center justify-center shrink-0"
-                            style={{ background: `${track.color}15`, border: `1px solid ${track.color}25` }}
-                          >
-                            <Icon className="h-4 w-4" style={{ color: track.color }} />
-                          </div>
-                          <div className="flex-1 min-w-0">
-                            <div className="flex items-center justify-between mb-1">
-                              <p className="text-xs font-medium text-zinc-300 truncate">{track.title}</p>
-                              <span className="text-[10px] text-zinc-600 ml-2 shrink-0">{percent}%</span>
+                  {/* My Tasks tab */}
+                  {rightTab === "tasks" && (
+                    <div className="space-y-1">
+                      {tasks.length === 0 ? (
+                        <div className="text-center py-6 space-y-2">
+                          <CheckSquare className="h-8 w-8 text-zinc-800 mx-auto" />
+                          <p className="text-xs text-zinc-600 leading-relaxed">
+                            No tasks yet. Open a lesson and add tasks from the Notes panel.
+                          </p>
+                        </div>
+                      ) : (
+                        <>
+                          {/* Pending tasks */}
+                          {pendingTasks.length > 0 && (
+                            <div className="space-y-1.5">
+                              {pendingTasks.map((task) => (
+                                <div key={task.id} className="group flex items-start gap-2.5 p-2.5 rounded-xl bg-zinc-800/50 border border-zinc-700/40 hover:border-zinc-700 transition-colors">
+                                  <button
+                                    onClick={() => toggleTask(task.id)}
+                                    className="mt-0.5 shrink-0 text-zinc-600 hover:text-green-400 transition-colors"
+                                  >
+                                    <Square className="h-3.5 w-3.5" />
+                                  </button>
+                                  <div className="flex-1 min-w-0">
+                                    <p className="text-xs font-medium text-zinc-300 leading-snug">{task.title}</p>
+                                    {task.description && (
+                                      <p className="text-[10px] text-zinc-600 mt-0.5 leading-relaxed line-clamp-2">{task.description}</p>
+                                    )}
+                                    {task.lessonId && task.lessonTitle && (
+                                      <Link
+                                        href={`/tracks/${task.trackId}/${task.moduleId}/${task.lessonId}`}
+                                        className="inline-flex items-center gap-1 mt-1 text-[10px] text-blue-500 hover:text-blue-400 transition-colors"
+                                        onClick={(e) => e.stopPropagation()}
+                                      >
+                                        <ExternalLink className="h-2.5 w-2.5" />
+                                        {task.lessonTitle}
+                                      </Link>
+                                    )}
+                                  </div>
+                                </div>
+                              ))}
                             </div>
-                            <Progress value={percent} color={track.color} className="h-1" />
-                            <p className="text-[10px] text-zinc-600 mt-1">{completed}/{total} done</p>
-                          </div>
-                          <ChevronRight className="h-3.5 w-3.5 text-zinc-700 group-hover:text-zinc-400 transition-colors shrink-0" />
-                        </Link>
-                      );
-                    })}
-                  </div>
-                ) : (
-                  <div className="text-center py-6 space-y-2">
-                    <BookOpen className="h-8 w-8 text-zinc-800 mx-auto" />
-                    <p className="text-xs text-zinc-600 leading-relaxed">
-                      Start a track below to see your in-progress courses here
-                    </p>
-                  </div>
-                )}
+                          )}
+
+                          {/* Completed tasks (collapsed) */}
+                          {completedTasks.length > 0 && (
+                            <div className="mt-3">
+                              <p className="text-[10px] uppercase tracking-widest text-zinc-700 mb-1.5">Completed ({completedTasks.length})</p>
+                              <div className="space-y-1">
+                                {completedTasks.map((task) => (
+                                  <div key={task.id} className="flex items-center gap-2.5 p-2 rounded-lg">
+                                    <button onClick={() => toggleTask(task.id)} className="shrink-0 text-green-500">
+                                      <Check className="h-3.5 w-3.5" />
+                                    </button>
+                                    <p className="text-[11px] text-zinc-600 line-through truncate">{task.title}</p>
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+                        </>
+                      )}
+                    </div>
+                  )}
+                </div>
               </motion.div>
 
               {/* Recently Completed */}

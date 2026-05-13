@@ -5,11 +5,13 @@ import { useState, useEffect, useCallback } from "react";
 export interface Task {
   id: string;
   title: string;
+  description?: string;
   completed: boolean;
   trackId?: string;
   moduleId?: string;
   lessonId?: string;
   lessonTitle?: string;
+  trackTitle?: string;
   createdAt: string;
 }
 
@@ -48,15 +50,27 @@ export function useTasks(profileId: string | null, options?: { trackId?: string;
   }, [refresh]);
 
   const addTask = useCallback(
-    (title: string, context?: { trackId?: string; moduleId?: string; lessonId?: string; lessonTitle?: string }) => {
+    (
+      title: string,
+      context?: {
+        description?: string;
+        trackId?: string;
+        moduleId?: string;
+        lessonId?: string;
+        lessonTitle?: string;
+        trackTitle?: string;
+      }
+    ) => {
       if (!profileId || !title.trim()) return;
       const all = loadTasks(profileId);
+      const { description, ...rest } = context ?? {};
       const task: Task = {
         id: crypto.randomUUID(),
         title: title.trim(),
+        description: description?.trim() || undefined,
         completed: false,
         createdAt: new Date().toISOString(),
-        ...context,
+        ...rest,
       };
       const updated = [...all, task];
       saveTasks(profileId, updated);
@@ -87,10 +101,5 @@ export function useTasks(profileId: string | null, options?: { trackId?: string;
     [profileId, refresh]
   );
 
-  const allTasks = useCallback(() => {
-    if (!profileId) return [];
-    return loadTasks(profileId);
-  }, [profileId]);
-
-  return { tasks, addTask, toggleTask, deleteTask, allTasks };
+  return { tasks, addTask, toggleTask, deleteTask };
 }

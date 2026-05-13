@@ -1,8 +1,8 @@
 "use client";
 
-import React, { useState } from "react";
+import React, { useState, useRef, useEffect } from "react";
 import Link from "next/link";
-import { Search, Menu, X, GitBranch, ChevronDown } from "lucide-react";
+import { Search, Menu, X, GitBranch, ChevronDown, UserPlus, Trash2, Check } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { SearchDialog } from "./SearchDialog";
 import { useProfile } from "@/lib/hooks/useProfile";
@@ -14,6 +14,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { cn } from "@/lib/utils";
 
 interface TopNavProps {
   onSidebarToggle: () => void;
@@ -22,10 +23,17 @@ interface TopNavProps {
 
 export function TopNav({ onSidebarToggle, sidebarOpen }: TopNavProps) {
   const [searchOpen, setSearchOpen] = useState(false);
-  const { profiles, activeProfile, setActiveProfile } = useProfile();
+  const [createOpen, setCreateOpen] = useState(false);
+  const [dropdownOpen, setDropdownOpen] = useState(false);
+  const [newName, setNewName] = useState("");
+  const [newBio, setNewBio] = useState("");
+  const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+  const nameInputRef = useRef<HTMLInputElement>(null);
+
+  const { profiles, activeProfile, setActiveProfile, createProfile, deleteProfile } = useProfile();
 
   // Global keyboard shortcut for search
-  React.useEffect(() => {
+  useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key === "k") {
         e.preventDefault();
@@ -35,6 +43,30 @@ export function TopNav({ onSidebarToggle, sidebarOpen }: TopNavProps) {
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
   }, []);
+
+  useEffect(() => {
+    if (createOpen) setTimeout(() => nameInputRef.current?.focus(), 50);
+  }, [createOpen]);
+
+  const handleCreate = () => {
+    if (!newName.trim()) return;
+    const profile = createProfile(newName, newBio);
+    setActiveProfile(profile);
+    setNewName("");
+    setNewBio("");
+    setCreateOpen(false);
+    setDropdownOpen(false);
+  };
+
+  const handleDelete = (id: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (confirmDelete === id) {
+      deleteProfile(id);
+      setConfirmDelete(null);
+    } else {
+      setConfirmDelete(id);
+    }
+  };
 
   return (
     <>
@@ -73,41 +105,130 @@ export function TopNav({ onSidebarToggle, sidebarOpen }: TopNavProps) {
         <div className="flex-1" />
 
         {/* Profile switcher */}
-        {activeProfile && (
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <Button variant="ghost" size="sm" className="gap-2 h-8 text-zinc-300 hover:text-white">
+        <DropdownMenu
+          open={dropdownOpen}
+          onOpenChange={(open) => {
+            setDropdownOpen(open);
+            if (!open) {
+              setCreateOpen(false);
+              setConfirmDelete(null);
+              setNewName("");
+              setNewBio("");
+            }
+          }}
+        >
+          <DropdownMenuTrigger asChild>
+            <Button variant="ghost" size="sm" className="gap-2 h-8 text-zinc-300 hover:text-white">
+              {activeProfile ? (
+                <>
+                  <div className="h-6 w-6 rounded-full bg-gradient-to-br from-blue-500 to-violet-500 flex items-center justify-center text-[10px] font-bold text-white shrink-0">
+                    {activeProfile.avatar}
+                  </div>
+                  <span className="hidden sm:block text-xs">{activeProfile.name}</span>
+                </>
+              ) : (
+                <div className="h-6 w-6 rounded-full bg-zinc-700 shrink-0" />
+              )}
+              <ChevronDown className="h-3 w-3 text-zinc-600" />
+            </Button>
+          </DropdownMenuTrigger>
+
+          <DropdownMenuContent
+            align="end"
+            className="w-56 bg-zinc-900 border-zinc-800"
+            onCloseAutoFocus={(e) => e.preventDefault()}
+          >
+            <DropdownMenuLabel className="text-xs text-zinc-500 font-normal">Profiles</DropdownMenuLabel>
+            <DropdownMenuSeparator className="bg-zinc-800" />
+
+            {profiles.map((profile) => (
+              <DropdownMenuItem
+                key={profile.id}
+                onClick={() => {
+                  setActiveProfile(profile);
+                  setDropdownOpen(false);
+                }}
+                className="flex items-center gap-2 text-sm cursor-pointer hover:bg-zinc-800 focus:bg-zinc-800 pr-2 group/item"
+              >
                 <div className="h-6 w-6 rounded-full bg-gradient-to-br from-blue-500 to-violet-500 flex items-center justify-center text-[10px] font-bold text-white shrink-0">
-                  {activeProfile.avatar}
+                  {profile.avatar}
                 </div>
-                <span className="hidden sm:block text-xs">{activeProfile.name}</span>
-                <ChevronDown className="h-3 w-3 text-zinc-600" />
-              </Button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="end" className="w-48 bg-zinc-900 border-zinc-800">
-              <DropdownMenuLabel className="text-xs text-zinc-500 font-normal">Switch Profile</DropdownMenuLabel>
-              <DropdownMenuSeparator className="bg-zinc-800" />
-              {profiles.map((profile) => (
-                <DropdownMenuItem
-                  key={profile.id}
-                  onClick={() => setActiveProfile(profile)}
-                  className="flex items-center gap-2 text-sm cursor-pointer hover:bg-zinc-800 focus:bg-zinc-800"
-                >
-                  <div className="h-6 w-6 rounded-full bg-gradient-to-br from-blue-500 to-violet-500 flex items-center justify-center text-[10px] font-bold text-white">
-                    {profile.avatar}
-                  </div>
-                  <div>
-                    <div className="text-zinc-200 text-xs">{profile.name}</div>
-                    <div className="text-zinc-600 text-[10px]">{profile.bio}</div>
-                  </div>
-                  {activeProfile.id === profile.id && (
-                    <div className="ml-auto h-1.5 w-1.5 rounded-full bg-green-500" />
+                <div className="flex-1 min-w-0">
+                  <div className="text-zinc-200 text-xs truncate">{profile.name}</div>
+                  <div className="text-zinc-600 text-[10px] truncate">{profile.bio}</div>
+                </div>
+                {activeProfile?.id === profile.id && (
+                  <div className="h-1.5 w-1.5 rounded-full bg-green-500 shrink-0" />
+                )}
+                <button
+                  onClick={(e) => handleDelete(profile.id, e)}
+                  title={confirmDelete === profile.id ? "Click again to confirm" : "Delete profile"}
+                  className={cn(
+                    "ml-1 p-1 rounded transition-all shrink-0",
+                    confirmDelete === profile.id
+                      ? "text-red-400 bg-red-900/30 opacity-100"
+                      : "text-zinc-600 hover:text-red-400 hover:bg-red-900/20 opacity-0 group-hover/item:opacity-100"
                   )}
-                </DropdownMenuItem>
-              ))}
-            </DropdownMenuContent>
-          </DropdownMenu>
-        )}
+                >
+                  {confirmDelete === profile.id ? (
+                    <Trash2 className="h-3 w-3" />
+                  ) : (
+                    <Trash2 className="h-3 w-3" />
+                  )}
+                </button>
+              </DropdownMenuItem>
+            ))}
+
+            <DropdownMenuSeparator className="bg-zinc-800" />
+
+            {/* Create new profile */}
+            {createOpen ? (
+              <div className="px-2 py-2 space-y-2" onClick={(e) => e.stopPropagation()}>
+                <input
+                  ref={nameInputRef}
+                  type="text"
+                  placeholder="Name"
+                  value={newName}
+                  onChange={(e) => setNewName(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === "Enter") handleCreate(); if (e.key === "Escape") setCreateOpen(false); }}
+                  className="w-full bg-zinc-800 border border-zinc-700 rounded px-2 py-1.5 text-xs text-zinc-200 placeholder-zinc-600 focus:outline-none focus:border-blue-500"
+                />
+                <input
+                  type="text"
+                  placeholder="Role / bio (optional)"
+                  value={newBio}
+                  onChange={(e) => setNewBio(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === "Enter") handleCreate(); if (e.key === "Escape") setCreateOpen(false); }}
+                  className="w-full bg-zinc-800 border border-zinc-700 rounded px-2 py-1.5 text-xs text-zinc-200 placeholder-zinc-600 focus:outline-none focus:border-blue-500"
+                />
+                <div className="flex gap-1.5">
+                  <button
+                    onClick={handleCreate}
+                    disabled={!newName.trim()}
+                    className="flex-1 flex items-center justify-center gap-1 py-1.5 rounded bg-blue-600 hover:bg-blue-500 disabled:opacity-40 disabled:cursor-not-allowed text-white text-xs font-medium transition-colors"
+                  >
+                    <Check className="h-3 w-3" />
+                    Create
+                  </button>
+                  <button
+                    onClick={() => { setCreateOpen(false); setNewName(""); setNewBio(""); }}
+                    className="px-3 py-1.5 rounded text-zinc-500 hover:text-zinc-300 text-xs transition-colors"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <DropdownMenuItem
+                onClick={(e) => { e.preventDefault(); setCreateOpen(true); }}
+                className="flex items-center gap-2 text-xs text-zinc-400 hover:text-zinc-200 cursor-pointer hover:bg-zinc-800 focus:bg-zinc-800"
+              >
+                <UserPlus className="h-3.5 w-3.5" />
+                New Profile
+              </DropdownMenuItem>
+            )}
+          </DropdownMenuContent>
+        </DropdownMenu>
       </header>
 
       <SearchDialog open={searchOpen} onOpenChange={setSearchOpen} />

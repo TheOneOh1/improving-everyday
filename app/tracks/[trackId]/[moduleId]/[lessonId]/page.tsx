@@ -33,6 +33,9 @@ import { Progress } from "@/components/ui/progress";
 import { getLessonWithContext, getTotalLessons } from "@/lib/content";
 import { useProgress } from "@/lib/hooks/useProgress";
 import { useProfile } from "@/lib/hooks/useProfile";
+import { useNotes } from "@/lib/hooks/useNotes";
+import { useTasks } from "@/lib/hooks/useTasks";
+import { useComments } from "@/lib/hooks/useComments";
 import { cn } from "@/lib/utils";
 
 const TRACK_ICONS: Record<string, React.ElementType> = {
@@ -64,6 +67,12 @@ export default function LessonPage() {
     activeProfile?.id ?? null
   );
   const [notesPanelOpen, setNotesPanelOpen] = useState(false);
+
+  // Activity counts for badge
+  const { notes } = useNotes(activeProfile?.id ?? null, params.trackId, params.moduleId, params.lessonId);
+  const { tasks } = useTasks(activeProfile?.id ?? null, { lessonId: params.lessonId });
+  const { comments } = useComments(params.trackId, params.moduleId, params.lessonId);
+  const activityCount = notes.length + tasks.filter((t) => !t.completed).length + comments.length;
 
   const ctx = getLessonWithContext(params.trackId, params.moduleId, params.lessonId);
   if (!ctx) return notFound();
@@ -205,10 +214,18 @@ export default function LessonPage() {
                   variant="ghost"
                   size="sm"
                   onClick={() => setNotesPanelOpen(true)}
-                  className="gap-2 text-zinc-400 hover:text-zinc-200"
+                  className={cn(
+                    "gap-2 text-zinc-400 hover:text-zinc-200 transition-colors",
+                    activityCount > 0 && "text-blue-400 hover:text-blue-300"
+                  )}
                 >
                   <NotebookPen className="h-4 w-4" />
                   Notes & Tasks
+                  {activityCount > 0 && (
+                    <span className="ml-0.5 px-1.5 py-0.5 text-[10px] font-semibold rounded-full bg-blue-500/20 text-blue-400 border border-blue-500/30">
+                      {activityCount}
+                    </span>
+                  )}
                 </Button>
                 <Button variant="ghost" size="icon" className="text-zinc-600 hover:text-zinc-300">
                   <Bookmark className="h-4 w-4" />
@@ -277,6 +294,7 @@ export default function LessonPage() {
         moduleId={params.moduleId}
         lessonId={params.lessonId}
         lessonTitle={lesson.title}
+        trackTitle={track.title}
       />
     </AppShell>
   );
