@@ -755,6 +755,121 @@ nproc                     # number of CPU cores
 lscpu                     # CPU details
 \`\`\`
 `,
+          interviewQuestions: [
+            {
+              question: "A process is consuming 100% CPU on a production server. How do you find it and deal with it?",
+              difficulty: "mid" as const,
+              answer: `**Step 1 — Identify the process:**
+\`\`\`bash
+# Real-time process view:
+top          # press P to sort by CPU
+htop         # more visual, easier to navigate
+
+# Quick snapshot:
+ps aux --sort=-%cpu | head -20  # top CPU consumers
+
+# If it's a Java process, find what it's doing:
+PID=$(ps aux --sort=-%cpu | awk 'NR==2{print $2}')
+\`\`\`
+
+**Step 2 — Investigate what it's doing:**
+\`\`\`bash
+# What system calls is it making?
+strace -p $PID -c -f 2>&1 | head -30
+# -c: count syscalls (summary), -f: follow threads
+
+# What files does it have open?
+lsof -p $PID | head -30
+
+# What's in its stack trace? (for compiled code)
+gdb -p $PID -batch -ex "thread apply all bt" 2>/dev/null
+
+# For Java: get thread dump
+kill -3 $PID  # prints thread dump to stdout
+jstack $PID   # Java thread dump tool
+
+# Check if it's in a spin loop:
+watch -n 1 'ps aux --sort=-%cpu | head -5'
+# If CPU stays at 100% without drops → likely infinite loop, not I/O wait
+\`\`\`
+
+**Step 3 — Assess and respond:**
+\`\`\`bash
+# Is it a critical production process?
+# YES: investigate first, kill only if it's causing broader outage
+
+# Reduce priority without killing (buy time):
+renice +15 -p $PID  # lower priority so other processes get CPU
+
+# Graceful shutdown:
+kill -15 $PID  # SIGTERM — ask process to shut down
+# If it doesn't respond after 30s:
+kill -9 $PID   # SIGKILL — force kill (no cleanup)
+\`\`\`
+
+**Common root causes:**
+- Infinite loop in application code (check recent deployments)
+- Runaway query without proper index (database query consuming CPU)
+- Log rotation causing massive file processing
+- Crypto mining malware (check if process name is unusual)`,
+            },
+            {
+              question: "Explain the Linux process lifecycle: fork(), exec(), wait(), and zombie processes.",
+              difficulty: "senior" as const,
+              answer: `**The fork-exec model:**
+
+Every process (except init/PID 1) is created by \`fork()\`:
+\`\`\`
+fork() → creates an EXACT COPY of the parent process
+         child gets a new PID, parent's PID becomes child's PPID
+         copy-on-write: shares parent's memory pages until written
+
+exec() → replaces the child's memory with a new program
+         the child is now a completely different program
+         PID remains the same
+
+Example: bash running 'ls':
+1. bash fork()s → new process, PID 12345, exact copy of bash
+2. child exec()s ls → PID 12345 is now the ls program
+3. ls runs, outputs, exits
+4. bash wait()s → collects exit status, child entry cleaned from process table
+\`\`\`
+
+**Zombie processes:**
+\`\`\`bash
+# A zombie is a process that exited but parent hasn't called wait():
+# The child is dead but still in the process table (PID kept for parent to collect status)
+
+ps aux | grep Z  # Z = zombie state
+
+# How zombies happen:
+# Parent creates child, child exits
+# Parent is too busy (or has a bug) and never calls wait()
+# Child lingers as zombie
+
+# Fix:
+# 1. Kill the PARENT (zombie children are adopted by init/PID 1, which calls wait())
+kill -9 <parent_PID>
+
+# 2. Fix the parent's code to call waitpid() properly
+# 3. If parent can't be killed: reboot (last resort)
+\`\`\`
+
+**Signals and process control:**
+\`\`\`bash
+# Common signals:
+SIGTERM (15) = graceful shutdown request (can be caught and handled)
+SIGKILL (9)  = immediate kill (cannot be caught, always works)
+SIGINT (2)   = Ctrl+C
+SIGHUP (1)   = terminal hangup (many daemons reload config on SIGHUP)
+SIGSTOP (19) = pause (cannot be caught)
+SIGCONT (18) = resume paused process
+
+# Rule: always try SIGTERM first, wait 30s, then SIGKILL
+kill -15 $PID && sleep 30 && kill -9 $PID 2>/dev/null
+\`\`\``,
+            },
+          ],
         },
         {
           id: "systemd-services",
