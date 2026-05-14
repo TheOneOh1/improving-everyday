@@ -19,6 +19,11 @@ import {
   Code2,
   Container,
   Globe,
+  Terminal,
+  Server,
+  ShieldCheck,
+  Cloud,
+  Sparkles,
   Bookmark,
   Share2,
   NotebookPen,
@@ -44,6 +49,11 @@ const TRACK_ICONS: Record<string, React.ElementType> = {
   python: Code2,
   docker: Container,
   "linux-networking": Globe,
+  linux: Terminal,
+  terraform: Server,
+  devsecops: ShieldCheck,
+  aws: Cloud,
+  "prompt-engineering": Sparkles,
 };
 
 const LESSON_TYPE_CONFIG: Record<string, { icon: React.ElementType; label: string; color: string }> = {

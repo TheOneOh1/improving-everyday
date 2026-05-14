@@ -24,12 +24,14 @@ export interface Track {
   id: string;
   title: string;
   description: string;
-  longDescription: string;
+  longDescription?: string;
   icon: string;
   color: string;
   gradient: string;
   modules: Module[];
-  tags: string[];
+  tags?: string[];
+  level?: DifficultyLevel;
+  estimatedHours?: number;
 }
 
 export interface LessonWithContext {

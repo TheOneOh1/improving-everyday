@@ -162,3 +162,18 @@ body {
 .track-linux-gradient {
   background: linear-gradient(135deg, rgba(225, 29, 72, 0.12) 0%, rgba(225, 29, 72, 0.04) 100%);
 }
+.track-linux-os-gradient {
+  background: linear-gradient(135deg, rgba(249, 115, 22, 0.12) 0%, rgba(249, 115, 22, 0.04) 100%);
+}
+.track-terraform-gradient {
+  background: linear-gradient(135deg, rgba(124, 58, 237, 0.12) 0%, rgba(124, 58, 237, 0.04) 100%);
+}
+.track-devsecops-gradient {
+  background: linear-gradient(135deg, rgba(220, 38, 38, 0.12) 0%, rgba(220, 38, 38, 0.04) 100%);
+}
+.track-aws-gradient {
+  background: linear-gradient(135deg, rgba(245, 158, 11, 0.12) 0%, rgba(245, 158, 11, 0.04) 100%);
+}
+.track-prompt-gradient {
+  background: linear-gradient(135deg, rgba(139, 92, 246, 0.12) 0%, rgba(139, 92, 246, 0.04) 100%);
+}

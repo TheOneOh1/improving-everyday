@@ -3,11 +3,27 @@ import { githubActionsTrack } from "./github-actions";
 import { pythonTrack } from "./python";
 import { dockerTrack } from "./docker";
 import { linuxNetworkingTrack } from "./linux-networking";
+import { linuxTrack } from "./linux";
+import { terraformTrack } from "./terraform";
+import { devsecopsTrack } from "./devsecops";
+import { awsTrack } from "./aws";
+import { promptEngineeringTrack } from "./prompt-engineering";
 import type { Track, LessonWithContext, Module, Lesson } from "./types";
 
 export * from "./types";
 
-export const tracks: Track[] = [gitTrack, githubActionsTrack, pythonTrack, dockerTrack, linuxNetworkingTrack];
+export const tracks: Track[] = [
+  gitTrack,
+  githubActionsTrack,
+  pythonTrack,
+  dockerTrack,
+  linuxNetworkingTrack,
+  linuxTrack,
+  terraformTrack,
+  devsecopsTrack,
+  awsTrack,
+  promptEngineeringTrack,
+];
 
 export function getTrack(trackId: string): Track | undefined {
   return tracks.find((t) => t.id === trackId);
