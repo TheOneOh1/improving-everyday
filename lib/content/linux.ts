@@ -997,6 +997,113 @@ systemctl enable --now backup.timer
 systemctl list-timers
 \`\`\`
 `,
+          interviewQuestions: [
+            {
+              question: "How do you create a systemd service for a custom application? What are the key unit file directives?",
+              difficulty: "mid" as const,
+              answer: `**Create a unit file at \`/etc/systemd/system/myapp.service\`:**
+\`\`\`ini
+[Unit]
+Description=My Application Server
+Documentation=https://github.com/myorg/myapp
+# Start after network is up and any dependencies:
+After=network-online.target postgresql.service
+Requires=postgresql.service    # hard dependency (fail if postgres fails)
+Wants=redis.service            # soft dependency (continue if redis is absent)
+
+[Service]
+Type=simple                    # process stays in foreground
+User=myapp                     # run as non-root
+Group=myapp
+WorkingDirectory=/opt/myapp
+
+# Environment:
+Environment=NODE_ENV=production
+EnvironmentFile=-/etc/myapp/env  # load env file (-prefix = ignore if missing)
+
+# Startup:
+ExecStartPre=/opt/myapp/check-deps.sh   # pre-start check
+ExecStart=/opt/myapp/server --port 3000
+ExecStop=/opt/myapp/shutdown.sh          # graceful shutdown script
+ExecReload=/bin/kill -HUP \$MAINPID      # reload config without restart
+
+# Restart policy:
+Restart=on-failure             # restart if exits with non-zero code
+RestartSec=5s                  # wait 5s before restart
+StartLimitIntervalSec=300      # window for start limit tracking
+StartLimitBurst=5              # max 5 restarts in 300s window
+
+# Resource limits:
+MemoryLimit=512M
+CPUQuota=50%                   # max 50% of one CPU
+
+# Security hardening:
+NoNewPrivileges=true
+ProtectSystem=strict           # read-only system directories
+PrivateTmp=true                # isolated /tmp
+
+[Install]
+WantedBy=multi-user.target
+\`\`\`
+
+\`\`\`bash
+# Enable and start:
+systemctl daemon-reload          # load new unit file
+systemctl enable myapp           # start on boot
+systemctl start myapp
+
+# Verify:
+systemctl status myapp
+journalctl -u myapp -f           # follow logs
+\`\`\``,
+            },
+            {
+              question: "A systemd service keeps failing and restarting. How do you debug it?",
+              difficulty: "junior" as const,
+              answer: `\`\`\`bash
+# Step 1 — See current status:
+systemctl status myapp
+# Shows: active/failed, exit code, last log lines
+
+# Step 2 — Read the full logs:
+journalctl -u myapp --since "1 hour ago"
+journalctl -u myapp -n 100 --no-pager
+
+# Filter to errors only:
+journalctl -u myapp -p err
+
+# Step 3 — Check the exit code:
+systemctl status myapp | grep "Main PID"
+# ExitCode=1 → application error
+# ExitCode=203 → ExecStart path not found
+# ExitCode=217 → User not found (User= in unit file doesn't exist)
+
+# Step 4 — Manual test run (outside systemd):
+sudo -u myapp /opt/myapp/server --port 3000
+# Run as the service user to reproduce permission issues
+
+# Step 5 — Check dependencies:
+systemctl list-dependencies myapp
+systemctl status postgresql.service  # if myapp Requires postgres
+
+# Step 6 — Check start limit:
+journalctl -u myapp | grep "Start request repeated"
+# If hitting the start limit, service stops restarting
+# Reset the limit: systemctl reset-failed myapp
+
+# Step 7 — Check resource limits:
+systemctl show myapp | grep -E "Memory|CPU|LimitNOFILE"
+journalctl -k | grep "oom" | grep myapp  # OOM kills
+\`\`\`
+
+**Common causes:**
+- Wrong User/Group in unit file (user doesn't exist)
+- ExecStart path wrong or not executable
+- Missing environment variables
+- Port already in use (another process on same port)
+- Database not ready when service starts (fix: add \`After=postgresql.service\`)`,
+            },
+          ],
         },
       ],
     },
@@ -1398,6 +1505,112 @@ apt install lynis
 lynis audit system
 \`\`\`
 `,
+          interviewQuestions: [
+            {
+              question: "How do you harden a fresh Linux server before deploying a web application?",
+              difficulty: "mid" as const,
+              answer: `**Systematic hardening checklist:**
+
+**1. Update and patch:**
+\`\`\`bash
+apt update && apt upgrade -y
+apt install -y unattended-upgrades  # automatic security updates
+dpkg-reconfigure -plow unattended-upgrades
+\`\`\`
+
+**2. SSH hardening:**
+\`\`\`bash
+# /etc/ssh/sshd_config:
+PermitRootLogin no
+PasswordAuthentication no    # require key-based auth only
+PubkeyAuthentication yes
+Port 2222                    # non-standard port (not security, just reduces bot noise)
+AllowUsers deploy admin      # whitelist specific users
+MaxAuthTries 3
+
+systemctl restart sshd
+\`\`\`
+
+**3. Firewall (UFW):**
+\`\`\`bash
+ufw default deny incoming
+ufw default allow outgoing
+ufw allow 2222/tcp           # SSH on custom port
+ufw allow 80/tcp             # HTTP
+ufw allow 443/tcp            # HTTPS
+ufw enable
+\`\`\`
+
+**4. Fail2ban — block brute force:**
+\`\`\`bash
+apt install -y fail2ban
+# Auto-blocks IPs with 5+ failed SSH attempts in 10 minutes
+systemctl enable --now fail2ban
+\`\`\`
+
+**5. Create a non-root deploy user:**
+\`\`\`bash
+adduser --disabled-password --gecos "" deploy
+usermod -aG sudo deploy      # sudo only when needed
+# Copy SSH keys for deploy user
+\`\`\`
+
+**6. Disable unused services:**
+\`\`\`bash
+systemctl list-units --type=service --state=running
+# Disable services you don't need: cups, avahi-daemon, etc.
+systemctl disable --now cups
+\`\`\`
+
+**7. Audit:**
+\`\`\`bash
+lynis audit system           # comprehensive security score
+ss -tlnp                     # check what's listening on which ports
+\`\`\``,
+            },
+            {
+              question: "Explain Linux file permissions. What does chmod 755 mean and when would you use setuid?",
+              difficulty: "junior" as const,
+              answer: `**Permission model:**
+
+Every file has 3 permission sets: Owner, Group, Others. Each has 3 bits: Read (4), Write (2), Execute (1).
+
+\`\`\`
+chmod 755 myfile
+  7 = 4+2+1 = rwx (owner: read, write, execute)
+  5 = 4+0+1 = r-x (group: read, execute, no write)
+  5 = 4+0+1 = r-x (others: read, execute, no write)
+
+chmod 644 config.txt
+  6 = 4+2+0 = rw- (owner: read, write)
+  4 = 4+0+0 = r-- (group: read only)
+  4 = 4+0+0 = r-- (others: read only)
+\`\`\`
+
+**Common patterns:**
+\`\`\`bash
+chmod 755 /usr/local/bin/myapp  # executable script: everyone can run, only owner writes
+chmod 644 /etc/config.conf      # config file: everyone reads, only owner writes
+chmod 600 ~/.ssh/id_rsa         # private key: only owner reads (SSH requires this)
+chmod 700 ~/.ssh/                # directory: only owner can access
+\`\`\`
+
+**Special bits:**
+- **setuid (4)**: Execute as the file's owner, not the running user. Example: \`/usr/bin/passwd\` runs as root (to modify /etc/shadow) even when run by a regular user. \`chmod 4755 file\`
+- **setgid (2)**: Execute as file's group. On directories: new files inherit the directory's group (useful for shared directories)
+- **sticky bit (1)**: On directories (like /tmp): only file owner can delete their files
+
+\`\`\`bash
+ls -la /usr/bin/passwd
+# -rwsr-xr-x root root  ← 's' in owner execute position = setuid
+\`\`\`
+
+**Security warning:** Setuid binaries are high-value attack targets — a bug in a setuid binary can lead to privilege escalation. Audit them:
+\`\`\`bash
+find / -perm /4000 -type f 2>/dev/null  # find all setuid files
+\`\`\``,
+            },
+          ],
         },
       ],
     },

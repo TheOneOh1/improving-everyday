@@ -157,6 +157,93 @@ curl -I https://example.com
 
 > **Tip:** "ping works but HTTP doesn't" means the issue is at Layer 7 (application), not the network itself.
 `,
+          interviewQuestions: [
+            {
+              question: "Walk me through the OSI model and where common network problems occur at each layer.",
+              difficulty: "junior" as const,
+              answer: `The OSI model has 7 layers. Network troubleshooting follows a bottom-up approach:
+
+**Layer 1 — Physical:** Cables, NICs, switches
+- Problem: no link, intermittent drops
+- Tools: \`ethtool eth0\` (link speed/duplex), \`ip link show\` (UP/DOWN)
+
+**Layer 2 — Data Link:** MAC addresses, VLANs, Ethernet frames
+- Problem: ARP failures, wrong VLAN, MAC flooding
+- Tools: \`arp -n\`, \`ip neigh\`, Wireshark (ARP filter)
+
+**Layer 3 — Network:** IP routing, ICMP
+- Problem: wrong subnet, missing route, firewall blocking ICMP
+- Tools: \`ping\`, \`traceroute\`, \`ip route show\`, \`ip addr show\`
+
+**Layer 4 — Transport:** TCP/UDP, ports, connections
+- Problem: firewall blocking port, wrong port, connection refused
+- Tools: \`ss -tlnp\`, \`nc -zv host port\`, \`telnet host port\`
+
+**Layer 7 — Application:** HTTP, DNS, TLS
+- Problem: wrong URL, cert error, app crash
+- Tools: \`curl -v\`, \`dig\`, \`openssl s_client\`
+
+**Troubleshooting heuristic:**
+\`\`\`bash
+# Layer 3: Can I ping?
+ping -c 4 10.0.0.1
+
+# Layer 4: Is the port open?
+nc -zv 10.0.0.1 443
+
+# Layer 7: Does the application respond?
+curl -v https://10.0.0.1/health
+
+# DNS: Does the name resolve?
+dig api.example.com
+nslookup api.example.com 8.8.8.8
+\`\`\`
+
+"ping works but HTTP fails" = Layer 3 OK but Layer 4/7 problem (firewall, wrong port, app crash).`,
+            },
+            {
+              question: "How does DNS resolution work end-to-end when you type a URL in a browser?",
+              difficulty: "mid" as const,
+              answer: `\`\`\`
+1. Browser checks its DNS cache → not found
+2. OS checks /etc/hosts → not found
+3. OS checks its resolver cache (nscd/systemd-resolved) → not found
+4. OS queries the configured recursive resolver (e.g., 8.8.8.8 or your ISP's resolver)
+
+At the recursive resolver:
+5. Resolver checks its cache → not found
+6. Resolver queries a Root Name Server (one of 13 root NS clusters):
+   "Who handles .com?" → Root NS returns addresses of .com TLD nameservers
+7. Resolver queries a .com TLD nameserver:
+   "Who handles example.com?" → TLD NS returns example.com's authoritative NS
+8. Resolver queries example.com's authoritative nameserver:
+   "What is the IP of www.example.com?" → Returns A record: 93.184.216.34
+
+9. Recursive resolver caches the answer (per TTL)
+10. Recursive resolver returns answer to OS
+11. OS caches it, returns to browser
+12. Browser connects to 93.184.216.34
+\`\`\`
+
+**TTL (Time To Live):** Each DNS record has a TTL. During that time, the resolver doesn't re-query the authoritative NS. Low TTL (60s) = faster propagation when you change IPs. High TTL (3600s) = less DNS traffic.
+
+**Debugging:**
+\`\`\`bash
+# Full resolution trace:
+dig +trace www.example.com
+
+# Check from specific resolver:
+dig @8.8.8.8 www.example.com
+dig @1.1.1.1 www.example.com
+
+# Find authoritative NS:
+dig NS example.com
+
+# Check TTL:
+dig www.example.com | grep -E "ANSWER|TTL"
+\`\`\``,
+            },
+          ],
         },
         {
           id: "tcp-ip-addressing",
