@@ -2939,6 +2939,622 @@ Security groups handle this automatically — with NACLs, you must do it manuall
             },
           ],
         },
+        {
+          id: "load-balancers",
+          title: "Load Balancers: ALB, NLB & Gateway LB",
+          duration: 55,
+          type: "lesson" as const,
+          description: "Master Elastic Load Balancing — when to choose ALB vs NLB vs GWLB, target groups, SSL termination, WAF integration, and production patterns.",
+          content: `# Load Balancers: ALB, NLB & Gateway LB
+
+AWS Elastic Load Balancing (ELB) is not a single product — it's a family of three fundamentally different load balancers, each built for different traffic patterns. Picking the wrong one is a common mistake that results in either missing features or unnecessary complexity.
+
+## Why Load Balancers Matter
+
+Without a load balancer, you have one server. When it fails, your application is down. When traffic spikes, it can't scale. A load balancer solves both problems: it distributes traffic across multiple backend targets and health-checks them continuously, removing unhealthy targets automatically.
+
+Beyond availability, load balancers also handle SSL termination (so your backend doesn't need to decrypt HTTPS), sticky sessions, request routing, and integration with WAF for security.
+
+## Application Load Balancer (ALB)
+
+ALB operates at **Layer 7 (HTTP/HTTPS/WebSocket)**. It understands HTTP — it can inspect URLs, headers, cookies, query strings, and request bodies to make intelligent routing decisions.
+
+**When to use ALB:**
+- Web applications and REST APIs
+- Microservices that need path-based or host-based routing
+- WebSocket connections
+- gRPC traffic
+- Any time you need HTTP-aware routing logic
+
+**Key capabilities:**
+
+**Content-based routing** — Route requests to different target groups based on:
+\`\`\`
+/api/* → backend-api target group (EC2 or ECS)
+/static/* → static-assets target group (or redirect to S3)
+images.example.com → image-service target group
+app.example.com → app target group
+\`\`\`
+
+**Target groups** — The set of backends ALB routes to. Targets can be:
+- EC2 instances (by instance ID)
+- IP addresses (private IPs of ECS tasks, Lambda, or on-prem servers)
+- Lambda functions (ALB invokes Lambda directly)
+- Other ALBs (for chaining)
+
+**Health checks** — ALB polls each target every N seconds on a configurable path (e.g., \`GET /health\`). A target must return HTTP 200 to be considered healthy. Unhealthy targets are removed from rotation within 2 health-check intervals.
+
+\`\`\`bash
+# Create an ALB
+aws elbv2 create-load-balancer \\
+  --name prod-alb \\
+  --subnets subnet-abc subnet-def \\
+  --security-groups sg-alb \\
+  --type application
+
+# Create a target group
+aws elbv2 create-target-group \\
+  --name api-targets \\
+  --protocol HTTP --port 8080 \\
+  --vpc-id vpc-xxx \\
+  --health-check-path /health \\
+  --health-check-interval-seconds 15 \\
+  --healthy-threshold-count 2
+
+# Add a listener with HTTPS + forward rule
+aws elbv2 create-listener \\
+  --load-balancer-arn arn:aws:elasticloadbalancing:... \\
+  --protocol HTTPS --port 443 \\
+  --certificates CertificateArn=arn:aws:acm:... \\
+  --default-actions Type=forward,TargetGroupArn=arn:...
+\`\`\`
+
+**SSL termination** — ALB decrypts HTTPS at the load balancer using an ACM certificate. Backend targets receive plain HTTP, eliminating per-server certificate management. ALB handles SSL renegotiation, TLS 1.3, and certificate rotation automatically.
+
+**WAF integration** — Associate an AWS WAF Web ACL with an ALB to block SQL injection, XSS, bot traffic, and specific IPs before requests reach your application.
+
+**Sticky sessions** — ALB can pin a user's requests to the same target using a cookie. Duration-based stickiness uses an ALB-generated cookie; application-based stickiness uses a cookie your application sets. Useful for sessions stored locally on the server (though stateless architectures avoid this need).
+
+## Network Load Balancer (NLB)
+
+NLB operates at **Layer 4 (TCP/UDP/TLS)**. It doesn't understand HTTP — it sees raw TCP connections and forwards them. This makes it extremely fast (sub-millisecond latency) and capable of handling millions of requests per second.
+
+**When to use NLB:**
+- Extremely high throughput or low-latency requirements
+- Non-HTTP protocols (SMTP, FTP, game servers, IoT)
+- Static IP addresses are required (NLB has static IPs per AZ)
+- Preserving the source IP of the client (NLB passes it through)
+- PrivateLink — NLB is required to expose services via AWS PrivateLink
+
+**Static IPs** — Each NLB gets one static IP per AZ. Unlike ALB (which uses DNS round-robin), NLB IPs don't change. This matters for:
+- Firewall rules that need to allowlist specific IPs
+- Clients that cache IP addresses
+- On-premises systems that require stable endpoints
+
+**Source IP preservation** — NLB forwards the client's original IP to the target. With ALB, the backend sees the ALB's IP and must read the \`X-Forwarded-For\` header. With NLB at the TCP level, the client IP arrives directly (for TCP targets in the same VPC).
+
+\`\`\`bash
+# NLB for a TCP service (e.g., a database proxy or game server)
+aws elbv2 create-load-balancer \\
+  --name prod-nlb \\
+  --subnets subnet-abc subnet-def \\
+  --type network
+
+aws elbv2 create-target-group \\
+  --name tcp-targets \\
+  --protocol TCP --port 5432 \\
+  --vpc-id vpc-xxx \\
+  --health-check-protocol TCP
+\`\`\`
+
+## Gateway Load Balancer (GWLB)
+
+GWLB is different from ALB and NLB — it's not for distributing your application traffic. It's for deploying **third-party network security appliances** (firewalls, intrusion detection systems, deep packet inspection) in a transparent, scalable, highly available way.
+
+GWLB operates at Layer 3 (IP) and uses the GENEVE protocol to forward packets to appliance instances. The appliances process traffic and return it, then GWLB forwards it to the original destination.
+
+**When to use GWLB:**
+- You're deploying a Palo Alto, Fortinet, or Check Point firewall in AWS
+- You need all VPC traffic inspected before it reaches your application
+- You want centralized security inspection across multiple VPCs
+
+## Choosing the Right Load Balancer
+
+| Scenario | Use |
+|---|---|
+| HTTP/HTTPS web apps, microservices | ALB |
+| Path/host-based routing needed | ALB |
+| WebSocket or gRPC | ALB |
+| Need static IP | NLB |
+| Ultra-low latency, TCP/UDP protocols | NLB |
+| Expose service via PrivateLink | NLB |
+| Third-party firewall/IDS appliance | GWLB |
+
+## Connection Draining / Deregistration Delay
+
+When you remove a target (e.g., during a deployment), the load balancer enters a draining period. Existing in-flight requests are allowed to complete; no new requests go to the deregistering target. After the deregistration delay (default 300 seconds, can be set to 0–3600), the target is fully removed. Set this to match your longest-running request duration.
+
+## Best Practices
+
+**Always span multiple AZs** — Deploy targets in at least 2 AZs. Enable cross-zone load balancing (default for ALB, optional for NLB) so traffic distributes evenly regardless of target count per AZ.
+
+**Use HTTP/2** — ALB supports HTTP/2 between client and ALB. This reduces connection overhead for browsers making many requests.
+
+**Access logs** — Enable ALB access logs to S3. They contain request time, client IP, target IP, response codes, and latency — invaluable for debugging and security audits.
+
+**Idle timeout** — ALB has a default 60-second idle timeout. If your application has long-running requests (file uploads, streaming), increase this to avoid timeouts.
+
+**Deletion protection** — Enable deletion protection on production load balancers to prevent accidental removal.`,
+          interviewQuestions: [
+            {
+              question: "When would you choose an NLB over an ALB?",
+              answer: "Choose NLB when: you need static IPs per AZ (for firewall allowlisting or clients that cache IPs), you need ultra-low latency at Layer 4 (NLB passes TCP packets without HTTP parsing), your protocol is non-HTTP (SMTP, game servers, custom TCP/UDP), you need source IP preservation at the TCP level, or you're exposing a service via AWS PrivateLink (which requires NLB). ALB is better for everything HTTP-related: routing, SSL termination, WAF, WebSocket, path-based rules.",
+              difficulty: "mid" as const,
+            },
+            {
+              question: "How does SSL termination at the ALB work, and what are the security implications?",
+              answer: "ALB decrypts HTTPS using an ACM certificate. The ALB then forwards the request to backend targets over plain HTTP (or re-encrypts with a backend certificate if you configure HTTPS on the target group). Implication: traffic between ALB and targets is unencrypted by default inside the VPC. This is acceptable in most enterprise architectures because the VPC is trusted and traffic never leaves AWS. For end-to-end encryption (compliance requirements), configure the target group with HTTPS protocol and install certificates on the targets. The client IP is preserved in the X-Forwarded-For header.",
+              difficulty: "mid" as const,
+            },
+          ],
+        },
+        {
+          id: "vpn-direct-connect",
+          title: "VPN & Direct Connect",
+          duration: 50,
+          type: "lesson" as const,
+          description: "Connect your on-premises network to AWS securely using Site-to-Site VPN, Client VPN, and AWS Direct Connect — understanding when to use each and how they compare.",
+          content: `# VPN & Direct Connect
+
+When your organization has on-premises servers, offices, or data centres that need to communicate with AWS, you have two fundamental options: encrypt traffic over the internet (VPN), or get a dedicated physical circuit to AWS (Direct Connect). Each has dramatically different cost, latency, and reliability characteristics.
+
+## Site-to-Site VPN
+
+A Site-to-Site VPN creates an **IPsec encrypted tunnel** between your on-premises network (or another cloud) and your AWS VPC. Traffic travels over the public internet but is encrypted end-to-end.
+
+**How it works:**
+1. You create a **Virtual Private Gateway (VGW)** and attach it to your VPC
+2. You create a **Customer Gateway** representing your on-premises router (its public IP and routing config)
+3. AWS creates two VPN tunnels for redundancy (each with a different AWS endpoint IP)
+4. Your on-premises VPN device establishes the IPsec connection using BGP or static routes
+
+Two tunnels is critical — AWS performs maintenance on tunnels periodically. If you only use one, you'll have brief outages. Both tunnels should always be active, with your router doing ECMP load balancing across them.
+
+\`\`\`bash
+# Create a Virtual Private Gateway
+aws ec2 create-vpn-gateway \\
+  --type ipsec.1 \\
+  --amazon-side-asn 64512
+
+# Attach VGW to VPC
+aws ec2 attach-vpn-gateway \\
+  --vpn-gateway-id vgw-xxx \\
+  --vpc-id vpc-xxx
+
+# Create Customer Gateway (your on-prem router)
+aws ec2 create-customer-gateway \\
+  --type ipsec.1 \\
+  --public-ip 203.0.113.10 \\
+  --bgp-asn 65000
+
+# Create VPN Connection
+aws ec2 create-vpn-connection \\
+  --type ipsec.1 \\
+  --customer-gateway-id cgw-xxx \\
+  --vpn-gateway-id vgw-xxx \\
+  --options StaticRoutesOnly=false
+\`\`\`
+
+**VPN throughput limits:** Each VPN tunnel has a maximum throughput of **1.25 Gbps**. With both tunnels active, you can achieve ~2.5 Gbps. This is a hard limit imposed by the VGW — you cannot increase it. If you need more, use Direct Connect.
+
+**Latency:** VPN routes over the public internet. Latency is variable and depends on internet conditions between your office and AWS. Expect 10–100ms for nearby regions, more for distant ones. For latency-sensitive applications (real-time databases, voice), VPN latency is often unacceptable.
+
+## AWS Client VPN
+
+Client VPN is a managed VPN solution for **individual users** (laptops, remote workers) to access resources in your VPC — unlike Site-to-Site which connects entire networks.
+
+Based on OpenVPN, each user installs the AWS VPN client. Upon connection, they receive a private IP from a client CIDR that gives them access to your VPC resources.
+
+**Use cases:**
+- Remote developers accessing private RDS databases or internal APIs
+- Admin access to EC2 instances in private subnets (replacing bastion hosts)
+- Contractors who need temporary VPC access
+
+\`\`\`bash
+# Client VPN requires an ACM certificate for the server
+# and optionally a client certificate for mutual TLS
+
+aws ec2 create-client-vpn-endpoint \\
+  --client-cidr-block 10.100.0.0/22 \\
+  --server-certificate-arn arn:aws:acm:... \\
+  --authentication-options Type=certificate-authentication,... \\
+  --connection-log-options Enabled=true,CloudwatchLogGroup=/vpn/connections \\
+  --vpc-id vpc-xxx
+
+# Associate with subnet(s) for HA
+aws ec2 associate-client-vpn-target-network \\
+  --client-vpn-endpoint-id cvpn-endpoint-xxx \\
+  --subnet-id subnet-xxx
+\`\`\`
+
+**Pricing:** Client VPN charges per association (per AZ) per hour plus per connected client per hour. For 100+ concurrent users, costs add up quickly — consider comparing against a NAT Gateway + bastion setup.
+
+## AWS Direct Connect
+
+Direct Connect is a **dedicated physical network connection** from your data centre or colocation facility to an AWS Direct Connect location. Your network traffic never traverses the public internet.
+
+**Why Direct Connect matters:**
+
+- **Consistent latency** — Dedicated fibre has deterministic latency unlike the internet. Typical: 1–5ms for nearby DX locations.
+- **High bandwidth** — 1 Gbps, 10 Gbps, or 100 Gbps connections. For large data transfers, Direct Connect is 5–10x cheaper than internet data transfer fees.
+- **No bandwidth limits** — Unlike VPN's 1.25 Gbps ceiling, Direct Connect scales to 100 Gbps.
+- **Required for compliance** — Some financial and healthcare regulations require traffic to never traverse the public internet.
+
+**Direct Connect architecture:**
+
+\`\`\`
+Your DC → Cross-connect → DX location → AWS backbone → VPC
+\`\`\`
+
+You work with a Direct Connect Partner (Equinix, Cologix, etc.) to establish a cross-connect at a DX location. AWS then provisions a **hosted connection** (1 Gbps, sold by partners) or a **dedicated connection** (1/10/100 Gbps, direct from AWS).
+
+**Virtual Interfaces (VIFs):**
+- **Private VIF** — Access to a single VPC via a Virtual Private Gateway
+- **Public VIF** — Access to AWS public services (S3, DynamoDB, API endpoints) via public IPs without internet
+- **Transit VIF** — Connect to a Transit Gateway for access to multiple VPCs
+
+**Direct Connect Gateway** — Allows a single Direct Connect connection to reach VPCs in multiple regions. Without it, you'd need a separate DX connection per region.
+
+**Failover strategy:** Direct Connect is a single physical circuit — if the fibre is cut, you lose connectivity. For resilient production environments:
+1. Two Direct Connect connections from different DX locations (high resilience)
+2. One Direct Connect + Site-to-Site VPN as backup (cost-effective)
+3. Two DX connections at different DX locations + VPN fallback (maximum resilience)
+
+\`\`\`bash
+# Accept a Direct Connect connection (after partner provisions)
+aws directconnect confirm-connection \\
+  --connection-id dxcon-xxx
+
+# Create a Private VIF to reach your VPC
+aws directconnect create-private-virtual-interface \\
+  --connection-id dxcon-xxx \\
+  --new-private-virtual-interface virtualInterfaceName=prod-vif,vlan=100,asn=65000,authKey=yourBGPkey,amazonAddress=169.254.0.1/30,customerAddress=169.254.0.2/30,virtualGatewayId=vgw-xxx
+\`\`\`
+
+## VPN vs Direct Connect Comparison
+
+| Factor | Site-to-Site VPN | Direct Connect |
+|---|---|---|
+| Latency | Variable (internet) | Consistent (dedicated) |
+| Max bandwidth | ~2.5 Gbps | 100 Gbps |
+| Setup time | Minutes | Weeks to months |
+| Monthly cost | ~$36/month + data | $100–$2000+/month |
+| Internet dependency | Yes (encrypted) | No |
+| HA built-in | 2 tunnels per connection | Requires 2nd connection |
+| Use for | Dev/staging, lower traffic | Production, large data transfer |
+
+## Best Practices
+
+**Always configure both VPN tunnels** — AWS maintenance rotates tunnels. If you only use one, every maintenance window causes an outage.
+
+**Use BGP over static routes for VPN** — BGP dynamically advertises routes and detects failures faster than static routing.
+
+**Direct Connect for large data transfers** — Moving terabytes of data? Direct Connect egress costs ~$0.02/GB vs internet ~$0.09/GB. At 100 TB/month, that's $7,000/month saved.
+
+**Combine DX with VPN for HA** — Even if DX is your primary, keep a VPN as a hot standby. Route traffic via DX (lower BGP MED), fail over to VPN automatically if DX goes down.`,
+          interviewQuestions: [
+            {
+              question: "When would you choose Direct Connect over Site-to-Site VPN?",
+              answer: "Choose Direct Connect when: you need consistent, predictable latency (real-time systems, financial apps), you transfer large volumes of data regularly (Direct Connect egress is ~5x cheaper than internet), you need more than 2.5 Gbps bandwidth (VPN ceiling), compliance prohibits internet-routed traffic, or you need guaranteed bandwidth for production workloads. VPN is appropriate for: dev/test environments, quick setup needs, lower traffic volumes, or as a DR failover for Direct Connect. Most mature enterprises use both — Direct Connect as primary, VPN as backup.",
+              difficulty: "mid" as const,
+            },
+          ],
+        },
+        {
+          id: "transit-gateway",
+          title: "Transit Gateway, VPC Peering & PrivateLink",
+          duration: 50,
+          type: "lesson" as const,
+          description: "Design scalable multi-VPC architectures using Transit Gateway, understand VPC Peering limitations, expose services with PrivateLink, and use VPC Endpoints to eliminate NAT costs.",
+          content: `# Transit Gateway, VPC Peering & PrivateLink
+
+As organizations grow on AWS, they accumulate multiple VPCs — one per environment, one per business unit, one per compliance boundary. Connecting them is a networking design problem with significant cost and complexity implications.
+
+## VPC Peering — Simple but Limited
+
+VPC Peering creates a direct, private connection between exactly two VPCs. Traffic routes through AWS's backbone network, not the internet. Peered VPCs can communicate as if they were on the same network.
+
+**How it works:**
+1. Account A requests a peering connection with Account B's VPC
+2. Account B accepts the request
+3. Both sides update their route tables to add routes pointing to the peered VPC's CIDR via the peering connection
+4. Security groups in each VPC can reference the peered VPC's security group by ID
+
+\`\`\`bash
+# Create peering request (from Account A)
+aws ec2 create-vpc-peering-connection \\
+  --vpc-id vpc-aaa \\
+  --peer-vpc-id vpc-bbb \\
+  --peer-owner-id 123456789012 \\
+  --peer-region us-west-2
+
+# Accept peering (from Account B)
+aws ec2 accept-vpc-peering-connection \\
+  --vpc-peering-connection-id pcx-xxx
+
+# Add route in Account A's route table
+aws ec2 create-route \\
+  --route-table-id rtb-aaa \\
+  --destination-cidr-block 10.1.0.0/16 \\
+  --vpc-peering-connection-id pcx-xxx
+\`\`\`
+
+**Critical limitation: Non-transitive routing**
+
+VPC Peering is NOT transitive. If VPC-A peers with VPC-B, and VPC-B peers with VPC-C, VPC-A **cannot** reach VPC-C through VPC-B. Each pair that needs connectivity requires its own peering connection.
+
+With 10 VPCs that all need to talk to each other: 10 × 9 / 2 = **45 peering connections**. Each requires route table entries on both sides. This becomes unmanageable.
+
+**When VPC peering is appropriate:**
+- 2–4 VPCs that need private connectivity
+- Simple hub-and-spoke where spokes don't need to talk to each other
+- You need the lowest possible latency (peering has slightly lower overhead than Transit Gateway)
+- Cross-region connectivity between exactly two VPCs
+
+## Transit Gateway — Hub-and-Spoke at Scale
+
+Transit Gateway (TGW) is a regional transit hub. Instead of connecting every VPC to every other VPC, each VPC connects once to the Transit Gateway. All routing goes through TGW, enabling full-mesh connectivity with a fraction of the operational complexity.
+
+**Architecture:**
+\`\`\`
+VPC-Prod ─┐
+VPC-Dev  ─┼─→ Transit Gateway ←─── Direct Connect / VPN
+VPC-Data ─┘
+\`\`\`
+
+**How it works:**
+1. Create a Transit Gateway in your account
+2. Attach VPCs to the TGW (creates a TGW attachment in each VPC's subnet)
+3. TGW has a route table where you define what each attachment can reach
+4. By default, all attachments can reach all others — you can segment with separate route tables
+
+\`\`\`bash
+# Create Transit Gateway
+aws ec2 create-transit-gateway \\
+  --description "Central hub" \\
+  --options AmazonSideAsn=64512,AutoAcceptSharedAttachments=disable,DefaultRouteTableAssociation=enable
+
+# Attach a VPC to TGW
+aws ec2 create-transit-gateway-vpc-attachment \\
+  --transit-gateway-id tgw-xxx \\
+  --vpc-id vpc-prod \\
+  --subnet-ids subnet-prod-a subnet-prod-b
+
+# Add route in VPC route table pointing to TGW
+aws ec2 create-route \\
+  --route-table-id rtb-prod \\
+  --destination-cidr-block 10.0.0.0/8 \\
+  --transit-gateway-id tgw-xxx
+\`\`\`
+
+**TGW Route Tables for segmentation:** You can create multiple TGW route tables to control which VPCs can reach each other. Example:
+- Production route table: routes to prod VPCs only
+- Shared services route table: routes to all VPCs (for a shared services VPC with DNS, monitoring, Active Directory)
+- Dev route table: routes to dev VPCs only, can reach shared services but not prod
+
+**Multicast support:** TGW is the only AWS networking construct that supports IP multicast — useful for real-time media streaming, financial market data feeds.
+
+**Direct Connect integration:** Attach a Direct Connect Gateway to TGW, giving all attached VPCs access to on-premises networks through a single DX connection. This avoids the complexity of connecting each VPC separately to DX.
+
+**Cross-account, cross-region:** TGW supports RAM (Resource Access Manager) sharing to other AWS accounts. TGW Peering allows connecting TGWs in different regions — enabling global multi-VPC architectures.
+
+**Pricing:** TGW charges per attachment-hour and per GB processed. For 10 VPCs with moderate traffic, TGW costs roughly $300–500/month — but replaces 45 peering connections and their operational overhead.
+
+## AWS PrivateLink
+
+PrivateLink solves a different problem: exposing a service from one VPC so that other VPCs can consume it — without those VPCs having general access to each other.
+
+**The pattern:**
+- Provider VPC: your service runs here. Create a VPC Endpoint Service backed by an **NLB**.
+- Consumer VPC: create an Interface Endpoint pointing to the provider's endpoint service.
+- The consumer gets a private DNS name and private IP that routes to your service through AWS's backbone.
+
+**Why PrivateLink instead of VPC Peering?**
+- With peering, the consumer can reach any resource in your VPC (within security group rules)
+- With PrivateLink, consumers can only reach the specific service exposed through the NLB — your VPC internals are completely invisible to them
+
+**Built-in AWS PrivateLink services:** Many AWS services are accessible via PrivateLink: SSM, ECR, CloudWatch, Secrets Manager, STS, and more. Create Interface Endpoints in your VPC so instances in private subnets can access these AWS APIs without a NAT Gateway.
+
+\`\`\`bash
+# Create an Interface Endpoint for SSM (allows SSM in private subnets)
+aws ec2 create-vpc-endpoint \\
+  --vpc-id vpc-xxx \\
+  --service-name com.amazonaws.us-east-1.ssm \\
+  --vpc-endpoint-type Interface \\
+  --subnet-ids subnet-private-a subnet-private-b \\
+  --security-group-ids sg-endpoint \\
+  --private-dns-enabled
+\`\`\`
+
+## VPC Gateway Endpoints — Free for S3 and DynamoDB
+
+For S3 and DynamoDB specifically, AWS offers **Gateway Endpoints** — they're free and don't require an ENI. They work by adding an entry to your route table: traffic destined for S3's IP ranges routes through the endpoint instead of the NAT Gateway.
+
+This is one of the most impactful cost optimizations available: if your instances in private subnets access S3 or DynamoDB frequently, NAT Gateway costs can be significant. A Gateway Endpoint eliminates that NAT charge entirely.
+
+\`\`\`bash
+# Create S3 Gateway Endpoint (free)
+aws ec2 create-vpc-endpoint \\
+  --vpc-id vpc-xxx \\
+  --service-name com.amazonaws.us-east-1.s3 \\
+  --vpc-endpoint-type Gateway \\
+  --route-table-ids rtb-private-a rtb-private-b
+\`\`\`
+
+## Choosing the Right Connectivity Option
+
+| Need | Solution |
+|---|---|
+| Connect 2–3 VPCs simply | VPC Peering |
+| Connect 4+ VPCs, any-to-any | Transit Gateway |
+| Connect all VPCs to on-premises | TGW + Direct Connect/VPN |
+| Expose one service to other VPCs | PrivateLink |
+| Access AWS services from private subnets | VPC Endpoints (Interface or Gateway) |
+| Eliminate NAT costs for S3/DynamoDB | Gateway Endpoints (free) |`,
+          interviewQuestions: [
+            {
+              question: "Why can't you use VPC Peering to connect 10 VPCs in a full mesh, and what's the alternative?",
+              answer: "VPC Peering is non-transitive — traffic cannot flow through an intermediate VPC. A→B→C doesn't work even if A-B and B-C are peered. 10 VPCs in full mesh requires 45 peering connections, each needing route table entries on both sides. The operational complexity is unsustainable. Use Transit Gateway instead: each VPC connects once to TGW (10 attachments total), TGW routes between all of them, and a single route table entry in each VPC handles all inter-VPC traffic. TGW also integrates with Direct Connect and VPN for on-premises connectivity.",
+              difficulty: "mid" as const,
+            },
+          ],
+        },
+        {
+          id: "cloudfront-route53",
+          title: "CloudFront, Route 53 & Global Accelerator",
+          duration: 55,
+          type: "lesson" as const,
+          description: "Accelerate and globally distribute your applications using CloudFront CDN, Route 53 DNS with advanced routing policies, and AWS Global Accelerator for TCP/UDP workloads.",
+          content: `# CloudFront, Route 53 & Global Accelerator
+
+AWS provides three services that operate at a global level to get traffic from users to your application faster and more reliably. Understanding when to use each — and how they combine — is essential for production architecture.
+
+## Amazon CloudFront — CDN
+
+CloudFront is a **Content Delivery Network (CDN)** with 450+ **Points of Presence (PoPs)** worldwide. When a user requests content, CloudFront serves it from the PoP closest to them. If the PoP has the content cached, it serves it immediately. If not, it fetches it from your **origin** (S3, ALB, EC2, or any HTTP server), caches it, and serves it.
+
+**Why this matters:** A user in Mumbai requesting content from your us-east-1 ALB has ~200ms round-trip latency. The same request served from a Mumbai PoP: ~5ms. For static assets (JavaScript, CSS, images), this is a 40x improvement.
+
+**Origins:**
+- **S3 bucket** — Best for static sites. Use Origin Access Control (OAC) to allow only CloudFront to access the bucket (keep the bucket private).
+- **ALB or EC2** — For dynamic APIs. CloudFront caches GET responses; POSTs are always forwarded to origin.
+- **Custom HTTP origin** — Any server with an HTTP endpoint (on-premises, other clouds).
+
+\`\`\`bash
+# Create a CloudFront distribution
+aws cloudfront create-distribution --distribution-config '{
+  "Origins": {
+    "Quantity": 1,
+    "Items": [{
+      "Id": "S3-my-bucket",
+      "DomainName": "my-bucket.s3.amazonaws.com",
+      "S3OriginConfig": { "OriginAccessIdentity": "" }
+    }]
+  },
+  "DefaultCacheBehavior": {
+    "ViewerProtocolPolicy": "redirect-to-https",
+    "CachePolicyId": "658327ea-f89d-4fab-a63d-7e88639e58f6",
+    "Compress": true,
+    "AllowedMethods": { "Quantity": 2, "Items": ["GET", "HEAD"] }
+  },
+  "Enabled": true,
+  "HttpVersion": "http2and3",
+  "PriceClass": "PriceClass_All"
+}'
+\`\`\`
+
+**Cache behaviors** — Different URL patterns can have different caching rules. Example:
+- \`/api/*\` — No caching, always forward to ALB origin
+- \`/static/*\` — Cache for 365 days (assets have content-hashed filenames)
+- \`/images/*\` — Cache for 30 days, compress images
+
+**Cache invalidation** — When you deploy new code, CloudFront serves the old cached version until TTL expires. To force immediate refresh:
+\`\`\`bash
+aws cloudfront create-invalidation \\
+  --distribution-id EDFDVBD6EXAMPLE \\
+  --paths "/app.js" "/app.css"
+# Wildcard: "/static/*" invalidates all cached static files
+# Full invalidation: "/*" — costs $0.005 per path after first 1000/month
+\`\`\`
+
+**WAF + CloudFront** — Attach an AWS WAF Web ACL at the CloudFront level to block attacks before they ever reach your origin. This is the cheapest place to absorb DDoS — CloudFront absorbs the traffic at the edge, protecting your origin from being overwhelmed.
+
+**Lambda@Edge and CloudFront Functions** — Run code at PoPs to modify requests and responses without a round-trip to origin. Use cases:
+- A/B testing by modifying the request URL
+- Adding security headers to every response
+- Authentication at the edge (JWT verification)
+- URL normalization and redirects
+
+## Amazon Route 53 — DNS
+
+Route 53 is AWS's managed DNS service. It's globally distributed, has 100% SLA, and supports domain registration, DNS record management, and health checking.
+
+**Record types:**
+- **A record** — Maps a hostname to an IPv4 address
+- **AAAA record** — Maps to an IPv6 address
+- **CNAME** — Alias to another hostname (cannot be used at the zone apex — \`example.com\` itself)
+- **Alias record** — AWS-specific extension. Like CNAME but works at zone apex, and resolves to AWS resource IPs dynamically (ALB, CloudFront, S3 website). Use Alias records for AWS resources.
+
+**Routing policies — the differentiator:**
+
+**Simple** — One record, one or more values. DNS returns all values; the client picks one randomly.
+
+**Weighted** — Multiple records with weights. Send 90% of traffic to v1, 10% to v2 for a canary deploy.
+\`\`\`bash
+# 10% canary routing
+aws route53 change-resource-record-sets --hosted-zone-id Z123 --change-batch '{
+  "Changes": [
+    {"Action": "UPSERT", "ResourceRecordSet": {
+      "Name": "api.example.com", "Type": "A",
+      "SetIdentifier": "v1", "Weight": 90,
+      "AliasTarget": {"HostedZoneId": "...", "DNSName": "v1-alb.us-east-1.elb.amazonaws.com", "EvaluateTargetHealth": true}
+    }},
+    {"Action": "UPSERT", "ResourceRecordSet": {
+      "Name": "api.example.com", "Type": "A",
+      "SetIdentifier": "v2", "Weight": 10,
+      "AliasTarget": {"HostedZoneId": "...", "DNSName": "v2-alb.us-east-1.elb.amazonaws.com", "EvaluateTargetHealth": true}
+    }}
+  ]
+}'
+\`\`\`
+
+**Latency-based** — Route to the AWS region with the lowest measured latency for the user's DNS resolver. Not geographic — a user in Europe may resolve to us-east-1 if transatlantic latency is lower than eu-west-1.
+
+**Geolocation** — Route based on the geographic source of the DNS query. Control exactly which region serves which country. Useful for GDPR (EU users must hit EU endpoints), content licensing, or language-specific backends.
+
+**Geoproximity** — Like geolocation but with a bias parameter. You can expand or shrink a region's "catchment area" to shift load between regions, not just by geography but by adjustable distance.
+
+**Failover** — Primary/secondary setup with health checks. Route 53 polls your endpoint every 30 seconds. If the health check fails for 3 consecutive attempts, traffic fails over to the secondary record. Use for active-passive DR configurations.
+
+**Health checks** — Route 53 has its own health check infrastructure (distributed across AWS globally). Health checks can monitor:
+- HTTP/HTTPS endpoints (specific URL, expected response string)
+- TCP connections
+- CloudWatch alarms (for complex health logic)
+- Other health checks (calculated health checks combining multiple)
+
+## AWS Global Accelerator
+
+Global Accelerator routes TCP and UDP traffic to your application using AWS's global private backbone network instead of the public internet. Unlike CloudFront (which is HTTP-focused and uses caching), Global Accelerator is transport-layer and doesn't cache — it's purely a network accelerator.
+
+**How it works:**
+1. AWS assigns you two static **Anycast IP addresses** that are announced from all AWS edge locations worldwide
+2. Users connect to the nearest edge location using the public internet (shortest path)
+3. Traffic then travels AWS's private backbone from that edge location to your application (lowest latency, consistent bandwidth)
+
+**Key benefits:**
+- **Static IPs** — Two fixed IPs instead of DNS (useful when clients don't support DNS-based failover)
+- **Instant failover** — Global Accelerator detects endpoint failures in seconds and reroutes via the anycast network — no DNS TTL delay
+- **TCP performance** — The public internet path is minimized; most latency improvement comes from removing the long internet path
+
+**CloudFront vs Global Accelerator:**
+
+| | CloudFront | Global Accelerator |
+|---|---|---|
+| Protocol | HTTP/HTTPS | TCP/UDP (any) |
+| Caching | Yes | No |
+| Use case | Static content, APIs | Gaming, IoT, VoIP, real-time |
+| Entry point | Edge PoP | Edge PoP (Anycast) |
+| Static IP | No (DNS-based) | Yes (2 Anycast IPs) |
+
+Use CloudFront for HTTP applications that benefit from caching. Use Global Accelerator for non-HTTP protocols, or when you need static IPs and faster failover than DNS allows.`,
+          interviewQuestions: [
+            {
+              question: "What is the difference between Route 53 latency-based and geolocation routing?",
+              answer: "Latency-based routing measures actual network latency from the user's DNS resolver to each AWS region and routes to the lowest-latency option. This is dynamic and can route a European user to us-east-1 if that latency is lower. Geolocation routing routes based on the geographic location of the DNS query (by continent, country, or US state) regardless of latency. It's deterministic — users in Germany always go to eu-west-1. Use latency-based for performance optimization, geolocation for data sovereignty (GDPR), content licensing, or language-specific routing.",
+              difficulty: "mid" as const,
+            },
+          ],
+        },
       ],
       exam: [
         { question: "You launch an EC2 instance in a public subnet but cannot SSH into it. What do you check?", answer: "1) Security group inbound rules — must allow TCP port 22 from your IP (or 0.0.0.0/0 for open access). 2) The subnet must have 'auto-assign public IP' enabled, or the instance needs an Elastic IP. 3) The route table for the subnet must have a route 0.0.0.0/0 → Internet Gateway. 4) The Internet Gateway must be attached to the VPC. 5) The key pair used to launch must match the .pem file you're using. 6) Network ACLs — check they allow inbound port 22 AND outbound ephemeral ports (1024-65535).", difficulty: "junior" as const },
@@ -5507,6 +6123,1112 @@ aws cloudwatch put-dashboard --dashboard-name "API-Production" \\
         { question: "A developer accidentally deleted the aws-auth ConfigMap on EKS. How do you recover access?", answer: "The aws-auth ConfigMap controls who can authenticate to the cluster via IAM. If deleted, only the IAM identity that created the cluster retains access. Recovery: 1) Use the cluster creator's IAM credentials to run kubectl. 2) Recreate the aws-auth ConfigMap with the correct IAM user/role mappings. Format: mapRoles for IAM roles (recommended), mapUsers for specific IAM users. 3) Add back all admin roles and the node group instance role (required for nodes to join the cluster). Prevention: Use GitOps (Flux or ArgoCD) to manage the aws-auth ConfigMap so it's always in source control and auto-reconciled.", difficulty: "senior" as const },
         { question: "How does Fargate work with EKS, and when would you choose it over managed node groups?", answer: "EKS Fargate runs each pod on its own dedicated compute without you managing EC2 nodes. You create Fargate profiles that match pods by namespace and labels. When a matching pod is scheduled, EKS provisions Fargate compute (billed per pod per second). Choose Fargate when: You want no node management overhead, you need strong workload isolation (each pod on its own microVM), or for batch/short-lived workloads. Choose managed node groups when: You need DaemonSets (Fargate doesn't support them), you need specific instance types or GPUs, you have long-running services where EC2 pricing is cheaper, or you need to mount node-local storage.", difficulty: "mid" as const },
         { question: "How do you implement cluster-level autoscaling in EKS when pods can't be scheduled due to insufficient node capacity?", answer: "Install Cluster Autoscaler (CA): 1) Create an IAM role with IRSA for the CA pod with permissions to modify Auto Scaling Groups. 2) Deploy CA with the annotation specifying the cluster name. 3) Tag your node group ASG with 'k8s.io/cluster-autoscaler/enabled: true' and 'k8s.io/cluster-autoscaler/cluster-name: my-cluster'. 4) CA watches for pending pods and scales up the matching node group's ASG, then scales down when nodes are underutilized for 10+ minutes. Alternative: Karpenter (AWS's newer autoscaler) is more flexible — it directly provisions EC2 instances without needing predefined node groups and can pick the most cost-efficient available instance type.", difficulty: "senior" as const },
+      ],
+    },
+
+    // ─────────────────────────────────────────
+    // MODULE 9 — AWS Organizations & Multi-Account
+    // ─────────────────────────────────────────
+    {
+      id: "aws-organizations",
+      title: "AWS Organizations & Multi-Account Strategy",
+      level: "intermediate" as const,
+      description: "Design secure, governed, cost-efficient multi-account AWS environments using Organizations, SCPs, IAM Identity Center, Control Tower, and FinOps best practices.",
+      lessons: [
+        {
+          id: "organizations-accounts",
+          title: "AWS Organizations & Account Structure",
+          duration: 55,
+          type: "lesson" as const,
+          description: "Understand why multi-account is the AWS best practice, how Organizations works, and how to structure accounts with Organizational Units and Service Control Policies.",
+          content: `# AWS Organizations & Multi-Account Strategy
+
+Running everything in a single AWS account is the fastest way to get started, but it becomes a liability as soon as you have a team, multiple environments, or compliance requirements. AWS Organizations is the service that lets you manage many accounts as a single logical unit.
+
+## Why Multi-Account?
+
+**Blast radius isolation** — If a developer runs \`aws ec2 terminate-instances --instance-ids $(aws ec2 describe-instances --query 'Reservations[].Instances[].InstanceId' --output text)\` in the wrong account, the damage is contained to that account. In a single-account setup, the same command could destroy your production database.
+
+**Security boundary** — IAM policies within an account can be complex and are easy to misconfigure. Account boundaries are enforced by AWS itself — no IAM policy can grant cross-account access unless both sides explicitly allow it. This is a fundamentally stronger isolation than IAM roles.
+
+**Billing separation** — Different accounts for different teams/products let you attribute costs accurately without relying on tagging discipline.
+
+**Compliance** — PCI-DSS, HIPAA, and SOC2 often require isolation of in-scope systems. Separate accounts make audit boundaries clear.
+
+**AWS recommends separate accounts for:** each environment (prod, staging, dev), each business unit or product team, security tooling, shared services (networking, logging), sandboxes, and backup/disaster recovery.
+
+## AWS Organizations Structure
+
+An Organization has a hierarchical structure:
+
+\`\`\`
+Root (Management Account)
+├── Security OU
+│   ├── Log Archive Account     ← centralized CloudTrail, Config logs
+│   └── Security Tooling Account ← GuardDuty master, Security Hub
+├── Infrastructure OU
+│   ├── Network Account         ← Transit Gateway, Direct Connect
+│   └── Shared Services Account ← Active Directory, monitoring
+├── Workloads OU
+│   ├── Production OU
+│   │   ├── Prod-AppA Account
+│   │   └── Prod-AppB Account
+│   └── Development OU
+│       ├── Dev-AppA Account
+│       └── Dev-AppB Account
+└── Sandbox OU
+    └── Developer Sandboxes (one per developer)
+\`\`\`
+
+**Management Account (root)** — The account that creates the Organization. Never deploy workloads here — it's the master account for billing and governance only. Treat it like a production server: minimal access, strong MFA on root.
+
+**Organizational Units (OUs)** — Folders for accounts. You apply policies at the OU level and they cascade to all accounts within.
+
+\`\`\`bash
+# Create an organization
+aws organizations create-organization --feature-set ALL
+
+# Create an OU under the root
+ROOT_ID=$(aws organizations list-roots --query 'Roots[0].Id' --output text)
+aws organizations create-organizational-unit \\
+  --parent-id $ROOT_ID \\
+  --name "Workloads"
+
+# Create a new account in the organization
+aws organizations create-account \\
+  --email prod-app@company.com \\
+  --account-name "Prod-AppA"
+
+# Move the new account into the Workloads OU
+aws organizations move-account \\
+  --account-id 123456789012 \\
+  --source-parent-id $ROOT_ID \\
+  --destination-parent-id ou-xxx-yyy
+\`\`\`
+
+## Service Control Policies (SCPs)
+
+SCPs are the most powerful governance tool in Organizations. They are **permission boundaries applied at the account or OU level** that restrict what IAM principals in those accounts can do — even the root user.
+
+SCPs don't grant permissions — they only restrict. An action is allowed only if it's permitted by BOTH the SCP and the IAM policy. Even if an IAM admin has \`Action: "*"\`, if the SCP denies an action, it's blocked.
+
+**Common SCPs:**
+
+\`\`\`json
+// Deny any action that's not in approved regions
+{
+  "Statement": [{
+    "Sid": "DenyNonApprovedRegions",
+    "Effect": "Deny",
+    "NotAction": [
+      "iam:*", "organizations:*", "route53:*",
+      "budgets:*", "waf:*", "cloudfront:*"
+    ],
+    "Resource": "*",
+    "Condition": {
+      "StringNotEquals": {
+        "aws:RequestedRegion": ["us-east-1", "us-west-2", "eu-west-1"]
+      }
+    }
+  }]
+}
+\`\`\`
+
+\`\`\`json
+// Prevent disabling CloudTrail
+{
+  "Statement": [{
+    "Sid": "DenyCloudTrailDisable",
+    "Effect": "Deny",
+    "Action": [
+      "cloudtrail:DeleteTrail",
+      "cloudtrail:StopLogging",
+      "cloudtrail:UpdateTrail"
+    ],
+    "Resource": "*"
+  }]
+}
+\`\`\`
+
+\`\`\`json
+// Require MFA for sensitive actions
+{
+  "Statement": [{
+    "Sid": "DenyDangerousWithoutMFA",
+    "Effect": "Deny",
+    "Action": ["iam:DeletePolicy", "iam:CreateUser", "iam:AttachRolePolicy"],
+    "Resource": "*",
+    "Condition": {
+      "BoolIfExists": { "aws:MultiFactorAuthPresent": "false" }
+    }
+  }]
+}
+\`\`\`
+
+**Apply an SCP to an OU:**
+\`\`\`bash
+aws organizations attach-policy \\
+  --policy-id p-xxx \\
+  --target-id ou-xxx-yyy
+\`\`\`
+
+## IAM Identity Center (SSO)
+
+IAM Identity Center (formerly AWS SSO) is the recommended way to grant human access to multiple AWS accounts without creating IAM users in each account.
+
+**How it works:**
+1. You configure an identity source: AWS managed directory, or federate with your corporate IdP (Okta, Azure AD, Google Workspace via SAML 2.0 or SCIM)
+2. Define Permission Sets — essentially IAM role templates (e.g., AdministratorAccess, ReadOnlyAccess, DeveloperAccess)
+3. Assign users/groups from your IdP to specific accounts with specific permission sets
+4. Users visit the AWS access portal, see all accounts they have access to, and click to get temporary credentials (via AssumeRoleWithWebIdentity)
+
+**Benefits:**
+- Single sign-on: one login for 50 accounts
+- No IAM users per account
+- Central audit: all access visible in one place
+- Temporary credentials: no long-lived access keys
+- Automatic provisioning when employees join/leave via SCIM
+
+\`\`\`bash
+# Enable IAM Identity Center (done in console, then manage via CLI)
+# After enabling, create a permission set
+aws sso-admin create-permission-set \\
+  --instance-arn arn:aws:sso:::instance/ssoins-xxx \\
+  --name "DeveloperAccess" \\
+  --session-duration PT8H
+
+# Attach an AWS managed policy to the permission set
+aws sso-admin attach-managed-policy-to-permission-set \\
+  --instance-arn arn:aws:sso:::instance/ssoins-xxx \\
+  --permission-set-arn arn:aws:sso:::permissionSet/... \\
+  --managed-policy-arn arn:aws:iam::aws:policy/PowerUserAccess
+
+# Assign permission set to a user for a specific account
+aws sso-admin create-account-assignment \\
+  --instance-arn arn:aws:sso:::instance/ssoins-xxx \\
+  --target-id 123456789012 \\
+  --target-type AWS_ACCOUNT \\
+  --permission-set-arn arn:aws:sso:::permissionSet/... \\
+  --principal-type USER \\
+  --principal-id user-id-from-identity-store
+\`\`\`
+
+## AWS Control Tower
+
+Control Tower is a managed service that sets up and governs a multi-account environment using AWS best practices (the "Landing Zone"). It automates:
+- Organization structure with predefined OUs (Security, Sandbox)
+- Baseline SCPs for security guardrails
+- CloudTrail centralized logging to a Log Archive account
+- Config rules for compliance
+- IAM Identity Center for access management
+
+**Guardrails** (Control Tower's term for governance rules) come in three types:
+- **Preventive** — SCPs that block non-compliant actions
+- **Detective** — Config rules that flag violations without blocking
+- **Proactive** — CloudFormation hooks that prevent non-compliant resources from being created
+
+Use Control Tower if you're starting a new Organization or want to retrofit governance onto an existing one without building all the SCPs and Config rules yourself.
+
+## Account Vending — Creating New Accounts Automatically
+
+In large organizations, developers request new accounts regularly. Manual creation doesn't scale. Account vending automates the process:
+
+1. Developer submits a request (Jira ticket, internal portal, Terraform PR)
+2. Automation runs a pipeline that calls \`organizations:CreateAccount\`
+3. New account is placed in the correct OU (so SCPs apply immediately)
+4. A baseline CloudFormation StackSet provisions required resources (IAM roles, CloudTrail, Config, VPC if needed)
+5. IAM Identity Center assignment is made for the requesting team
+
+**Service Catalog Account Factory** (part of Control Tower) or the open-source **Account Factory for Terraform (AFT)** implement this pattern.
+
+## Best Practices
+
+**Never deploy workloads in the management account.** Keep it solely for billing and governance. If compromised, it can modify your entire Organization.
+
+**Start with an OU per environment, not per team.** Prod/Non-prod separation with SCPs is more important than team isolation initially.
+
+**Apply SCPs at the OU level.** Avoid account-level SCPs for anything that applies broadly — OU inheritance keeps policy management centralized.
+
+**Enable GuardDuty in all accounts** — Use the Organizations integration to auto-enroll new accounts in GuardDuty with the Security account as the delegated administrator.
+
+**Centralize CloudTrail to an immutable log archive account.** Never give the accounts being monitored permission to modify the log destination.`,
+          interviewQuestions: [
+            {
+              question: "Why does AWS recommend a multi-account strategy instead of a single account with strong IAM policies?",
+              answer: "Account boundaries provide stronger isolation than IAM policies. IAM policies can be misconfigured, but an account boundary is enforced by AWS itself — no IAM policy in Account A can grant access to Account B's resources without explicit cross-account trust. Benefits of multi-account: blast radius isolation (a mistake in dev can't affect prod), security separation (compliance scopes are clear), billing attribution (costs per team/product without tagging discipline), and SCPs for governance that can't be overridden even by account admins. AWS recommends separate accounts for each environment, each business unit, shared services, and security tooling.",
+              difficulty: "mid" as const,
+            },
+            {
+              question: "What is a Service Control Policy (SCP) and how does it differ from an IAM policy?",
+              answer: "An SCP is a permission boundary applied at the Organization, OU, or account level that limits the maximum permissions available to principals in that account — even the root user. SCPs don't grant permissions; they only restrict them. An action is allowed only when BOTH the SCP permits it AND the IAM policy grants it. IAM policies, by contrast, grant specific permissions to specific principals within an account. A developer with AdministratorAccess (full IAM) is still blocked by an SCP that denies deploying resources outside approved regions. SCPs are the primary tool for enforcing organizational security and compliance requirements across all accounts.",
+              difficulty: "mid" as const,
+            },
+          ],
+        },
+        {
+          id: "billing-cost",
+          title: "Billing, Cost Management & FinOps",
+          duration: 50,
+          type: "lesson" as const,
+          description: "Master consolidated billing, AWS Budgets, Cost Explorer, Savings Plans, Reserved Instances, and FinOps practices to optimize your AWS spend.",
+          content: `# AWS Billing, Cost Management & FinOps
+
+Cloud costs are easy to grow and hard to control without deliberate practices. AWS provides a comprehensive set of tools for understanding, controlling, and optimizing spend — but they require intentional setup. FinOps (Financial Operations) is the practice of bringing financial accountability to cloud spending.
+
+## Consolidated Billing
+
+When accounts are in an AWS Organization, all charges are rolled up to the **management account**. The management account receives a single monthly bill covering all member accounts.
+
+**Key benefit — shared volume discounts:** AWS pricing tiers (e.g., S3 charges less per GB above 500 TB/month) are calculated across the entire Organization, not per account. If 10 accounts each use 100 TB, the Organization gets pricing as if it used 1,000 TB.
+
+**Reserved Instance and Savings Plans sharing:** RIs and Savings Plans purchased in any account apply across the entire Organization by default. If Prod buys a 3-year Reserved Instance for an m5.xlarge and Dev has an on-demand m5.xlarge, the RI discount applies to Dev automatically.
+
+\`\`\`bash
+# View cost allocation summary across accounts
+aws ce get-cost-and-usage \\
+  --time-period Start=2024-01-01,End=2024-02-01 \\
+  --granularity MONTHLY \\
+  --metrics BlendedCost \\
+  --group-by Type=DIMENSION,Key=LINKED_ACCOUNT
+\`\`\`
+
+## Cost Explorer
+
+Cost Explorer is the primary tool for understanding where money is going. Key features:
+
+**Filters and grouping:** Break down costs by service, region, account, tag, instance type, AZ, usage type. Group by multiple dimensions simultaneously.
+
+**Trends and forecasting:** Cost Explorer forecasts the current month's spend based on historical usage patterns. Useful for catching budget overruns before the month ends.
+
+**Rightsizing recommendations:** Cost Explorer analyzes EC2 utilization (CPU, memory via CloudWatch agent) and recommends cheaper instance types. Common finding: production instances running at 5% CPU for months.
+
+**Savings Plans recommendations:** Based on your On-Demand usage, Cost Explorer recommends the type and term of Savings Plans that would save the most.
+
+\`\`\`bash
+# Get a cost breakdown by service for last month
+aws ce get-cost-and-usage \\
+  --time-period Start=2024-01-01,End=2024-02-01 \\
+  --granularity MONTHLY \\
+  --metrics UnblendedCost \\
+  --group-by Type=DIMENSION,Key=SERVICE \\
+  --query 'ResultsByTime[0].Groups[*].{Service:Keys[0],Cost:Metrics.UnblendedCost.Amount}' \\
+  --output table
+
+# Get rightsizing recommendations
+aws ce get-rightsizing-recommendation \\
+  --service EC2 \\
+  --query 'RightsizingRecommendations[*].{Instance:CurrentInstance.ResourceId,Savings:RightsizingType,Estimated:SavingsPlansPurchaseRecommendationDetail}'
+\`\`\`
+
+## AWS Budgets
+
+Budgets let you set spending or usage limits and get alerted when approaching or exceeding them. Set up budgets immediately — they're free (first two budgets per month are free, then $0.02/day).
+
+**Budget types:**
+- **Cost budget** — Alert when spend exceeds $X
+- **Usage budget** — Alert when usage exceeds N hours of EC2
+- **Savings Plans coverage budget** — Alert when less than 80% of compute is covered by Savings Plans
+- **RI utilization budget** — Alert when RIs are underutilized
+
+\`\`\`bash
+# Create a monthly cost budget with alert at 80%
+aws budgets create-budget --account-id 123456789012 --budget '{
+  "BudgetName": "monthly-prod",
+  "BudgetLimit": { "Amount": "5000", "Unit": "USD" },
+  "BudgetType": "COST",
+  "TimeUnit": "MONTHLY",
+  "TimePeriod": { "Start": "2024-01-01T00:00:00Z" }
+}' --notifications-with-subscribers '[{
+  "Notification": {
+    "NotificationType": "ACTUAL",
+    "ComparisonOperator": "GREATER_THAN",
+    "Threshold": 80,
+    "ThresholdType": "PERCENTAGE"
+  },
+  "Subscribers": [{
+    "SubscriptionType": "EMAIL",
+    "Address": "finops@company.com"
+  }]
+}]'
+\`\`\`
+
+**Budget Actions:** Automatically take action when a budget threshold is hit — apply an SCP to deny new resource creation, or trigger a Lambda function to notify Slack.
+
+## Savings Plans vs Reserved Instances
+
+Both offer discounts up to 72% over On-Demand in exchange for a commitment to consistent usage over 1 or 3 years. The difference is flexibility.
+
+**Reserved Instances (RIs):**
+- Commit to a specific instance type in a specific region (e.g., m5.xlarge, us-east-1)
+- Standard RIs: 72% discount, cannot change instance type
+- Convertible RIs: 66% discount, can exchange for a different instance type
+- Can be bought and sold on the RI Marketplace if you need to exit early
+- Best for: databases (RDS, ElastiCache), workloads with a fixed instance type
+
+**Savings Plans:**
+- Commitment to a dollar amount per hour (e.g., $10/hour) rather than a specific instance type
+- **Compute Savings Plans:** Apply to any EC2 instance type, size, region, OS, and also to Lambda and Fargate. Most flexible. 66% max discount.
+- **EC2 Instance Savings Plans:** Apply to a specific instance family in a specific region (e.g., all m5 instances in us-east-1). Higher discount (72%), less flexible than Compute.
+- Cannot be sold on a marketplace — you're committed for the term
+
+**Choosing between them:**
+
+| Factor | Reserved Instances | Savings Plans |
+|---|---|---|
+| Flexibility | Low (specific instance type) | High (any compute) |
+| Max discount | 72% | 66% (Compute) / 72% (EC2) |
+| Applies to Lambda/Fargate | No | Yes (Compute SP) |
+| Tradeable | Yes (Standard RIs) | No |
+| Best for | Fixed databases, stable EC2 | Microservices, mixed workloads |
+
+\`\`\`bash
+# Check Savings Plans purchase recommendations
+aws savingsplans describe-savings-plans-purchase-recommendation \\
+  --savings-plans-type COMPUTE_SP \\
+  --term-in-years ONE_YEAR \\
+  --payment-option NO_UPFRONT \\
+  --query 'Recommendations[*].RecommendationDetails[*].{CurrentCost:CurrentAverageHourlyOnDemandSpend,CommitmentHourly:EstimatedSavingsPlansCost}'
+\`\`\`
+
+## Spot Instances — Up to 90% Discount
+
+Spot Instances use AWS's spare EC2 capacity. You specify a maximum price; if the spot price exceeds it, AWS gives you a 2-minute warning and terminates the instance.
+
+**When to use Spot:**
+- Stateless, fault-tolerant workloads (batch processing, ML training, CI/CD workers)
+- Stateful workloads with checkpointing (resume processing from last checkpoint)
+- Auto Scaling groups where the ASG can replace terminated instances
+
+**Spot Fleet / EC2 Fleet:** Request multiple instance types and sizes across AZs. AWS fills the request with the cheapest available combination, maintaining your target capacity even as individual instance types get interrupted.
+
+\`\`\`bash
+# Launch a Spot instance with interruption handling
+aws ec2 request-spot-instances \\
+  --spot-price "0.05" \\
+  --instance-count 1 \\
+  --type one-time \\
+  --launch-specification '{
+    "ImageId": "ami-xxx",
+    "InstanceType": "c5.2xlarge",
+    "KeyName": "my-key",
+    "SecurityGroupIds": ["sg-xxx"]
+  }'
+\`\`\`
+
+## Cost Allocation Tags
+
+Tags are the foundation of cost attribution. Without tags, Cost Explorer can only tell you costs by service — not which team or product is responsible.
+
+**Activate cost allocation tags:** Tags must be explicitly activated in the Billing Console to appear in Cost Explorer and billing reports. This is separate from creating the tags — they must be activated.
+
+**Enforce tagging with SCPs or Config rules:**
+\`\`\`json
+// Config rule: require specific tags on EC2 instances
+{
+  "ConfigRuleName": "required-tags",
+  "Source": { "Owner": "AWS", "SourceIdentifier": "REQUIRED_TAGS" },
+  "InputParameters": "{\"tag1Key\": \"Environment\", \"tag2Key\": \"Team\", \"tag3Key\": \"CostCenter\"}"
+}
+\`\`\`
+
+**FinOps tagging strategy:**
+- \`Environment\`: prod, staging, dev
+- \`Team\`: platform, data, frontend, backend
+- \`CostCenter\`: accounting code for chargeback
+- \`Project\`: specific project for cross-team attribution
+- \`ManagedBy\`: terraform, cloudformation, manual
+
+## FinOps Best Practices
+
+**Set budgets on day one** — Before any significant workload goes live. A surprise $50K bill because an S3 bucket had public access and was crawled by bots is avoidable.
+
+**Enable Cost Anomaly Detection** — Machine learning that alerts on unexpected spending spikes. Catches runaway Lambda loops, data transfer surprises, and forgotten resources.
+\`\`\`bash
+aws ce create-anomaly-monitor \\
+  --anomaly-monitor AnomalyMonitorType=DIMENSIONAL,AnomalyMonitorName=AllServices
+
+aws ce create-anomaly-subscription \\
+  --anomaly-subscription AnomalyMonitorArns=["arn:..."],Threshold=10,Frequency=DAILY,SubscriptionName=DailyAlertsSubscriptions,Subscribers=[{Address=finops@company.com,Type=EMAIL}]
+\`\`\`
+
+**Regularly review EC2 rightsizing recommendations** — Cost Explorer's rightsizing is free and often finds instances that were over-provisioned for a peak that passed months ago.
+
+**NAT Gateway is often the surprise** — Data processing intensive workloads frequently generate unexpected NAT Gateway costs. Add S3/DynamoDB VPC Gateway Endpoints and consider Interface Endpoints for high-traffic AWS service calls.
+
+**Delete unused resources** — Unused Elastic IPs ($0.005/hour), idle NAT Gateways ($0.045/hour + data), unattached EBS volumes, old snapshots. Schedule a monthly cleanup review.
+
+**Use S3 Intelligent-Tiering** — For data where access patterns are unknown, Intelligent-Tiering automatically moves objects between S3 tiers (Standard → Infrequent Access → Archive) at no retrieval cost.`,
+          interviewQuestions: [
+            {
+              question: "What is the difference between Compute Savings Plans and EC2 Instance Savings Plans?",
+              answer: "Compute Savings Plans apply to any EC2 instance regardless of instance family, size, region, OS, or tenancy — they also cover Lambda and Fargate costs. They offer up to 66% discount. EC2 Instance Savings Plans apply to a specific instance family in a specific region (e.g., all m5 instances in us-east-1) but allow any size/OS within that family. They offer up to 72% discount. Choose Compute SPs for flexibility (microservices, mixed instance types, Lambda/Fargate usage). Choose EC2 Instance SPs when you know you'll consistently use a specific instance family — you get higher discounts with less flexibility.",
+              difficulty: "mid" as const,
+            },
+            {
+              question: "How does Reserved Instance sharing work in an AWS Organization?",
+              answer: "Reserved Instances and Savings Plans purchased in any account within an Organization are automatically shared across all member accounts by default. If Account A buys an RI for an m5.xlarge and Account B is running an on-demand m5.xlarge, Account A's RI discount applies to Account B's instance automatically — reducing the organization's total bill. This sharing is bidirectional within the payer account relationship. You can disable RI sharing for specific accounts if needed. This sharing is why consolidated billing is valuable — volume discounts and RI/SP discounts compound across the entire organization.",
+              difficulty: "mid" as const,
+            },
+          ],
+        },
+      ],
+      exam: [
+        { question: "A developer accidentally created an EC2 instance with GPU in a region your company doesn't use. How do you prevent this organization-wide?", answer: "Apply a Service Control Policy (SCP) at the Organization or OU level that denies all actions in non-approved regions. Use 'StringNotEquals' on 'aws:RequestedRegion' condition, with IAM global actions (iam:*, route53:*, budgets:*) excluded since they're inherently global. Attach this SCP to the root or the relevant OU. It takes effect immediately for all new API calls in all member accounts, even for administrators. You cannot use IAM policies alone because account admins can modify their own IAM policies.", difficulty: "mid" as const },
+        { question: "How would you design access control so that each development team can access only their own AWS account, using your company's Okta directory?", answer: "Use IAM Identity Center with Okta as the external identity provider via SAML 2.0 or SCIM. Steps: 1) Enable IAM Identity Center in the management account. 2) Configure Okta as the identity source (SCIM for automatic user/group provisioning). 3) Create Permission Sets representing access levels (Developer, ReadOnly, Admin). 4) Assign Okta groups to specific accounts with specific Permission Sets. Okta group 'team-payments' gets DeveloperAccess only to the 'payments-prod' and 'payments-dev' accounts. Users access the AWS access portal with their Okta credentials and get temporary credentials for their assigned accounts.", difficulty: "mid" as const },
+        { question: "Your AWS bill was $80K last month but you expected $50K. How do you investigate?", answer: "1) Open Cost Explorer, group by Service, compare to previous month to identify the service with the largest increase. 2) Drill down into that service — group by Region, then Usage Type to identify what specifically spiked (data transfer, specific instance type, API calls). 3) Check Cost Anomaly Detection for any alerts that fired. 4) If the spike is recent, check CloudTrail for 'CreateResource' events correlating with the date of increase. 5) Use the Cost Explorer filter for the specific account where the spike occurred. Common culprits: NAT Gateway data processing, EC2 instances not terminated after testing, unexpected data transfer, S3 request costs from a public bucket being crawled.", difficulty: "mid" as const },
+        { question: "When should you use Reserved Instances vs Savings Plans?", answer: "Savings Plans (Compute) are generally preferred for EC2 workloads because they're flexible — they apply to any instance type, region, and also to Lambda and Fargate. Use Compute Savings Plans for dynamic workloads (ECS/EKS with varied instance types, Lambda). Use EC2 Instance Savings Plans when you're committed to a specific instance family in a specific region — you get 72% vs 66% discount. Use Reserved Instances for: RDS (Savings Plans don't cover RDS), ElastiCache, Redshift, and Elasticsearch — these services only have RI pricing, not Savings Plans. Always check Cost Explorer's recommendations, which model your actual usage patterns.", difficulty: "senior" as const },
+        { question: "How do you enforce tagging compliance for all new resources across 20 AWS accounts?", answer: "Two complementary approaches: 1) Preventive — Use AWS Config with a proactive evaluation mode and the 'required-tags' managed rule, or use CloudFormation hooks / Service Control Policies that deny resource creation without required tags. SCPs can block CreateInstance/CreateBucket if specific tags aren't present (using 'Null' condition on tag keys). 2) Detective — Enable AWS Config 'required-tags' rule in all accounts via a Config aggregator. Use Config remediation to auto-tag or notify when violations are found. For new accounts, use Control Tower guardrails or Service Catalog products that enforce tagging in the account baseline. The most effective approach is preventive — it forces developers to tag at creation rather than chasing them after.", difficulty: "senior" as const },
+      ],
+    },
+
+    // ─────────────────────────────────────────
+    // MODULE 10 — Databases Deep Dive
+    // ─────────────────────────────────────────
+    {
+      id: "aws-databases",
+      title: "Databases Deep Dive",
+      level: "intermediate" as const,
+      description: "Master Aurora, RDS Proxy, ElastiCache, DynamoDB advanced patterns, Redshift, and Database Migration Service for production-grade data architectures.",
+      lessons: [
+        {
+          id: "aurora-rds",
+          title: "Aurora & RDS Deep Dive",
+          duration: 60,
+          type: "lesson" as const,
+          description: "Understand Aurora's distributed storage architecture, Aurora Serverless v2, RDS Proxy for connection pooling, multi-region global databases, and production operational patterns.",
+          content: `# Aurora & RDS Deep Dive
+
+Amazon RDS lets you run managed relational databases — MySQL, PostgreSQL, MariaDB, Oracle, SQL Server — without managing the underlying server. Amazon Aurora is AWS's own cloud-native relational database engine that is source-compatible with MySQL and PostgreSQL but built from scratch for distributed cloud environments.
+
+## Why Aurora is Different
+
+Traditional RDS replicates the entire database (data pages + WAL) from primary to replica. Aurora separates storage from compute: the storage layer is a **distributed, fault-tolerant storage volume** shared by all instances in the cluster.
+
+**Aurora storage architecture:**
+- Storage is automatically distributed across 3 AZs in 10 GB chunks (extents)
+- Each 10 GB extent is replicated **6 ways** across 3 AZs (2 copies per AZ)
+- A write succeeds when 4 of 6 storage nodes acknowledge it (quorum write)
+- Read replicas share the same storage volume — no data copying needed
+- Storage autoscales from 10 GB to 128 TB automatically, no manual resize
+
+**Consequences of this architecture:**
+- Read replicas can be added in minutes (no snapshot restore needed)
+- Failover to a replica takes ~30 seconds (the replica already has the latest data)
+- You can lose an entire AZ and still have enough storage nodes for reads and writes
+- Replicas can serve reads from the same storage at minimal lag (typically < 10ms)
+
+## Aurora vs Standard RDS
+
+| Feature | Standard RDS | Aurora |
+|---|---|---|
+| Storage replication | 2x synchronous (multi-AZ) | 6x across 3 AZs |
+| Failover time | ~60-120 seconds | ~30 seconds |
+| Read replicas | Up to 5 (data copied) | Up to 15 (shared storage) |
+| Replica lag | Seconds | < 10ms typical |
+| Storage max | 64 TB | 128 TB |
+| Max IOPS | Instance-limited | 200,000+ |
+| Price | Lower | ~20% higher than RDS |
+
+Use Aurora when: you need high availability, fast failover, many read replicas, or performance beyond what a single RDS instance provides. Use standard RDS when: you need a specific engine version not supported by Aurora, you use Oracle or SQL Server (Aurora only supports MySQL/PostgreSQL-compatible), or you're cost-sensitive at smaller scale.
+
+## Creating an Aurora Cluster
+
+\`\`\`bash
+# Create Aurora PostgreSQL cluster
+aws rds create-db-cluster \\
+  --db-cluster-identifier prod-aurora \\
+  --engine aurora-postgresql \\
+  --engine-version 15.4 \\
+  --master-username admin \\
+  --master-user-password $(aws secretsmanager get-secret-value --secret-id db-password --query SecretString --output text) \\
+  --db-subnet-group-name prod-db-subnet-group \\
+  --vpc-security-group-ids sg-db \\
+  --storage-encrypted \\
+  --deletion-protection \\
+  --enable-cloudwatch-logs-exports '["postgresql"]'
+
+# Add the writer instance
+aws rds create-db-instance \\
+  --db-instance-identifier prod-aurora-writer \\
+  --db-cluster-identifier prod-aurora \\
+  --db-instance-class db.r6g.2xlarge \\
+  --engine aurora-postgresql
+
+# Add a reader instance
+aws rds create-db-instance \\
+  --db-instance-identifier prod-aurora-reader-1 \\
+  --db-cluster-identifier prod-aurora \\
+  --db-instance-class db.r6g.xlarge \\
+  --engine aurora-postgresql
+
+# Cluster endpoints:
+# Writer: prod-aurora.cluster-xxx.us-east-1.rds.amazonaws.com (always points to writer)
+# Reader: prod-aurora.cluster-ro-xxx.us-east-1.rds.amazonaws.com (load-balanced across readers)
+\`\`\`
+
+## Aurora Serverless v2
+
+Aurora Serverless v2 (ASv2) scales compute up and down in fractions of an Aurora Capacity Unit (ACU) in seconds — without a cold start. Unlike v1 (which paused to zero), v2 scales from a minimum ACU (e.g., 0.5 ACU = 1 GB RAM) to a maximum, responding to load in near real-time.
+
+**When ASv2 makes sense:**
+- Variable traffic: SaaS apps, APIs with unpredictable load patterns
+- Development/staging: scale to minimum when idle, burst for testing
+- Multi-tenant applications where each tenant's load is small and variable
+
+\`\`\`bash
+# Create Serverless v2 cluster
+aws rds create-db-cluster \\
+  --db-cluster-identifier dev-aurora-serverless \\
+  --engine aurora-postgresql \\
+  --engine-version 15.4 \\
+  --serverless-v2-scaling-configuration MinCapacity=0.5,MaxCapacity=16 \\
+  --master-username admin \\
+  --master-user-password mypassword \\
+  --db-subnet-group-name dev-subnet-group \\
+  --vpc-security-group-ids sg-dev-db
+
+# Add a serverless instance
+aws rds create-db-instance \\
+  --db-instance-identifier dev-aurora-serverless-writer \\
+  --db-cluster-identifier dev-aurora-serverless \\
+  --db-instance-class db.serverless \\
+  --engine aurora-postgresql
+\`\`\`
+
+## RDS Proxy — Connection Pooling
+
+A standard Aurora PostgreSQL instance handles roughly 500–2000 connections depending on instance size. Lambda functions and containerized microservices create new connections frequently — in a burst of 500 Lambda invocations, you could hit the connection limit instantly, causing "too many connections" errors.
+
+**RDS Proxy** sits between your application and Aurora, maintaining a persistent pool of database connections. Your application connects to the proxy, which multiplexes many application connections onto a smaller number of real database connections.
+
+**Benefits:**
+- Connection pooling: 1000 Lambda functions → RDS Proxy → 50 real DB connections
+- Failover: When the Aurora writer fails over to a reader, RDS Proxy handles reconnection automatically. Applications see connection pauses of < 30 seconds instead of needing to implement retry logic.
+- IAM authentication: Applications authenticate to the proxy using IAM tokens (no stored passwords)
+- Secrets Manager integration: The proxy retrieves and rotates database credentials from Secrets Manager
+
+\`\`\`bash
+# Create RDS Proxy
+aws rds create-db-proxy \\
+  --db-proxy-name prod-proxy \\
+  --engine-family POSTGRESQL \\
+  --auth '[{
+    "AuthScheme": "SECRETS",
+    "SecretArn": "arn:aws:secretsmanager:us-east-1:123456789012:secret:db-creds",
+    "IAMAuth": "REQUIRED"
+  }]' \\
+  --role-arn arn:aws:iam::123456789012:role/rds-proxy-role \\
+  --vpc-subnet-ids subnet-a subnet-b \\
+  --vpc-security-group-ids sg-proxy
+
+# Register the Aurora cluster as the target
+aws rds register-db-proxy-targets \\
+  --db-proxy-name prod-proxy \\
+  --db-cluster-identifiers prod-aurora
+\`\`\`
+
+## Aurora Global Database
+
+A Global Database replicates an Aurora cluster to up to 5 other regions with typical replication lag of < 1 second. The primary region handles all writes; secondary regions serve reads and can be promoted to primary in < 1 minute if the primary region fails.
+
+**Use cases:**
+- Disaster recovery with aggressive RTO/RPO (< 1 second data loss)
+- Serve reads locally to global users (Japanese users read from ap-northeast-1)
+- Regulatory: keep a copy of data in a specific country
+
+\`\`\`bash
+# Add a secondary region to an existing cluster
+aws rds create-global-cluster \\
+  --global-cluster-identifier global-prod-db \\
+  --source-db-cluster-identifier arn:aws:rds:us-east-1:123456789012:cluster:prod-aurora
+
+aws rds create-db-cluster \\
+  --db-cluster-identifier prod-aurora-eu \\
+  --global-cluster-identifier global-prod-db \\
+  --engine aurora-postgresql \\
+  --engine-version 15.4 \\
+  --region eu-west-1 \\
+  --db-subnet-group-name eu-db-subnet-group \\
+  --vpc-security-group-ids sg-eu-db
+\`\`\`
+
+## Production Best Practices
+
+**Automated backups** — Aurora backs up continuously to S3 with a retention period of 1–35 days. Point-in-time restore can restore to any second within the retention window.
+
+**Encryption at rest** — Enable with \`--storage-encrypted\` at cluster creation. Cannot be enabled post-creation without a snapshot restore.
+
+**Deletion protection** — Always enable on production clusters. Prevents accidental \`delete-db-cluster\` calls.
+
+**Parameter groups** — Tune database settings (work_mem, max_connections, shared_buffers for PostgreSQL) without restarting the instance using Dynamic parameters; Static parameters require a restart.
+
+**Enhanced Monitoring** — CloudWatch provides metrics every 60 seconds; Enhanced Monitoring provides OS-level metrics (CPU steal, memory per process) every 1–60 seconds using an agent on the instance.
+
+**Performance Insights** — Visual database profiling showing which SQL queries are consuming the most DB time. Free for 7 days retention, $0.02/hour for 2 years. The single most valuable tool for database performance troubleshooting.`,
+          interviewQuestions: [
+            {
+              question: "How does Aurora's storage architecture improve availability compared to standard RDS Multi-AZ?",
+              answer: "Standard RDS Multi-AZ synchronously replicates the entire database to a standby in another AZ. If the primary fails, AWS promotes the standby (~60-120 seconds). Aurora's storage is a distributed volume with 6 copies across 3 AZs (2 per AZ). Reads require 3 of 6 nodes, writes require 4 of 6. Aurora can lose an entire AZ and continue reading and writing without any failover. For compute failover (primary Aurora instance failure), a read replica already has the data — promotion takes ~30 seconds. Read replicas add capacity without data copying since all instances share the same storage.",
+              difficulty: "senior" as const,
+            },
+            {
+              question: "Why would you use RDS Proxy and when is it most valuable?",
+              answer: "RDS Proxy provides connection pooling between applications and RDS/Aurora. It's most valuable when: Lambda functions connect to RDS (Lambda scales to thousands of concurrent invocations, each creating a new connection — without a proxy, you hit connection limits). Also valuable for: containerized microservices with many instances, handling Aurora failover transparently (proxy reconnects automatically, apps see a ~30-second pause instead of needing retry logic), and using IAM authentication for database access (no stored passwords). Less valuable for: long-running applications with persistent connection pools, large EC2-based apps that manage their own pooling (PgBouncer, pgpool).",
+              difficulty: "mid" as const,
+            },
+          ],
+        },
+        {
+          id: "elasticache-dynamodb",
+          title: "ElastiCache & DynamoDB Advanced",
+          duration: 60,
+          type: "lesson" as const,
+          description: "Master Redis cluster mode, ElastiCache for session and object caching, DynamoDB data modeling, Global Tables, DAX, Streams, and production scaling patterns.",
+          content: `# ElastiCache & DynamoDB Advanced
+
+Two categories of non-relational databases dominate AWS architectures: in-memory caches (ElastiCache) for reducing latency and database load, and NoSQL key-value stores (DynamoDB) for massive scale with predictable performance.
+
+## Amazon ElastiCache
+
+ElastiCache provides managed Redis or Memcached. The choice between them is almost always Redis — it supports richer data structures, persistence, replication, and cluster mode. Memcached is simpler and slightly faster for pure object caching but lacks persistence and replication.
+
+### Redis Architecture Options
+
+**Single node** — For development or non-critical caching. One Redis instance, no replication.
+
+**Redis Replication Group (Cluster Mode Disabled)** — One primary node handles writes; 1–5 read replicas handle reads. Automatic failover promotes a replica to primary if the primary fails (~30 seconds). Data is on a single shard — maximum 500 GB per cluster.
+
+**Redis Cluster Mode Enabled** — Data is partitioned across multiple shards (up to 500 shards). Each shard has a primary and 0–5 replicas. This removes the 500 GB limit and allows horizontal write scaling.
+
+\`\`\`bash
+# Create a Redis replication group with 2 replicas
+aws elasticache create-replication-group \\
+  --replication-group-id prod-redis \\
+  --description "Production Redis" \\
+  --cache-node-type cache.r6g.xlarge \\
+  --engine redis \\
+  --engine-version 7.0 \\
+  --num-cache-clusters 3 \\
+  --automatic-failover-enabled \\
+  --at-rest-encryption-enabled \\
+  --transit-encryption-enabled \\
+  --auth-token $(aws secretsmanager get-secret-value --secret-id redis-token --query SecretString --output text) \\
+  --cache-subnet-group-name prod-redis-subnet \\
+  --security-group-ids sg-redis
+
+# Create a cluster mode enabled group with 3 shards, 2 replicas each
+aws elasticache create-replication-group \\
+  --replication-group-id prod-redis-cluster \\
+  --description "Production Redis Cluster" \\
+  --cache-node-type cache.r6g.xlarge \\
+  --engine redis \\
+  --num-node-groups 3 \\
+  --replicas-per-node-group 2 \\
+  --automatic-failover-enabled \\
+  --cluster-mode enabled
+\`\`\`
+
+### Common ElastiCache Patterns
+
+**Session storage** — Store user sessions in Redis instead of application servers. When using auto-scaling, sessions stored locally on EC2 are lost when the instance terminates. Redis sessions survive instance replacement.
+
+\`\`\`python
+import redis
+r = redis.Redis(host='prod-redis.xxx.cache.amazonaws.com', port=6379, ssl=True)
+
+# Store session with 1-hour expiry
+r.setex(f"session:{session_id}", 3600, json.dumps(user_data))
+
+# Retrieve session
+session = r.get(f"session:{session_id}")
+\`\`\`
+
+**Object caching (Cache-Aside pattern)** — Check Redis first; if miss, query the database and populate the cache:
+\`\`\`python
+def get_product(product_id):
+    cached = r.get(f"product:{product_id}")
+    if cached:
+        return json.loads(cached)
+
+    product = db.query("SELECT * FROM products WHERE id = %s", product_id)
+    r.setex(f"product:{product_id}", 300, json.dumps(product))  # 5-min TTL
+    return product
+\`\`\`
+
+**Rate limiting** — Use Redis atomic increment to count requests per user:
+\`\`\`python
+def is_rate_limited(user_id, limit=100, window=60):
+    key = f"ratelimit:{user_id}:{int(time.time() / window)}"
+    count = r.incr(key)
+    if count == 1:
+        r.expire(key, window)
+    return count > limit
+\`\`\`
+
+**Pub/Sub and Queues** — Redis Streams (Redis 5.0+) provide a persistent message stream similar to Kafka for lightweight use cases.
+
+### ElastiCache Sizing
+
+Match your cache to your working set — the data actually accessed regularly. Monitoring the \`CacheHitRate\` metric tells you how effective the cache is. Below 80% hit rate means either the cache is too small (evictions) or TTLs are too aggressive.
+
+\`\`\`bash
+# Monitor cache hit rate and evictions
+aws cloudwatch get-metric-statistics \\
+  --namespace AWS/ElastiCache \\
+  --metric-name CacheHitRate \\
+  --dimensions Name=ReplicationGroupId,Value=prod-redis \\
+  --start-time 2024-01-01T00:00:00Z --end-time 2024-01-02T00:00:00Z \\
+  --period 3600 --statistics Average
+\`\`\`
+
+## Amazon DynamoDB — Advanced Patterns
+
+DynamoDB is a fully managed NoSQL database that delivers single-digit millisecond latency at any scale. Understanding it deeply requires shifting from relational thinking to understanding how it partitions data.
+
+### Core Concepts
+
+**Partition key (PK)** — Determines which partition (physical storage node) a row lives on. AWS uses consistent hashing on the PK to distribute items across partitions. A good PK has high cardinality and even access distribution.
+
+**Sort key (SK)** — Optional second dimension of the primary key. Items with the same PK but different SK are stored together on the same partition, sorted by SK. This enables powerful query patterns.
+
+**Read/Write Capacity Units:**
+- 1 RCU = 1 strongly consistent read of up to 4 KB
+- 1 WCU = 1 write of up to 1 KB
+- On-Demand mode: pay per request (no capacity planning)
+- Provisioned mode: set RCUs and WCUs, enable auto-scaling
+
+### Data Modeling — Single Table Design
+
+Relational databases normalize data into many tables joined at query time. DynamoDB has no joins — you embed all related data in a single table, using PK/SK patterns to model relationships.
+
+**Example: e-commerce single table**
+\`\`\`
+PK                    SK                       Attributes
+USER#u001             PROFILE                  name, email, created_at
+USER#u001             ORDER#2024-001           total, status, created_at
+USER#u001             ORDER#2024-002           total, status, created_at
+ORDER#2024-001        ITEM#prod001             quantity, price
+ORDER#2024-001        ITEM#prod002             quantity, price
+PRODUCT#prod001       METADATA                 name, description, price
+\`\`\`
+
+Access patterns this enables:
+- Get user profile: \`PK=USER#u001, SK=PROFILE\`
+- Get all orders for user: \`PK=USER#u001, SK begins_with ORDER#\`
+- Get all items in order: \`PK=ORDER#2024-001, SK begins_with ITEM#\`
+
+**Global Secondary Index (GSI)** — Project a different attribute as the key for alternate query patterns. E.g., to query orders by status:
+\`\`\`
+GSI: PK=status, SK=created_at
+\`\`\`
+
+\`\`\`python
+import boto3
+dynamodb = boto3.resource('dynamodb')
+table = dynamodb.Table('ecommerce')
+
+# Get all orders for a user
+response = table.query(
+    KeyConditionExpression=Key('PK').eq('USER#u001') & Key('SK').begins_with('ORDER#'),
+    ScanIndexForward=False  # descending (newest first)
+)
+
+# Get pending orders via GSI
+response = table.query(
+    IndexName='status-created-index',
+    KeyConditionExpression=Key('status').eq('PENDING') & Key('created_at').gte('2024-01-01')
+)
+\`\`\`
+
+### DynamoDB Global Tables
+
+Global Tables replicate a DynamoDB table across multiple regions with multi-master writes. Every region can accept writes; DynamoDB uses a last-writer-wins conflict resolution based on timestamps.
+
+**Use cases:** Active-active multi-region architectures, disaster recovery (RPO ~0), low-latency reads and writes for global users.
+
+\`\`\`bash
+# Create a global table replica in eu-west-1
+aws dynamodb create-table-replica-to-region \\
+  --table-name orders \\
+  --region-name eu-west-1
+\`\`\`
+
+### DynamoDB Streams + Lambda (Event Sourcing)
+
+DynamoDB Streams captures a time-ordered sequence of item modifications. A Lambda function can process these changes for:
+- Syncing changes to Elasticsearch for search
+- Sending notifications when an order status changes
+- Maintaining aggregates (e.g., update user order count when a new order is created)
+- Replicating specific changes to another database
+
+\`\`\`bash
+# Enable streams on a table
+aws dynamodb update-table \\
+  --table-name orders \\
+  --stream-specification StreamEnabled=true,StreamViewType=NEW_AND_OLD_IMAGES
+
+# Map stream to Lambda function
+aws lambda create-event-source-mapping \\
+  --event-source-arn arn:aws:dynamodb:us-east-1:123456789012:table/orders/stream/2024-01-01 \\
+  --function-name process-order-changes \\
+  --batch-size 100 \\
+  --starting-position TRIM_HORIZON
+\`\`\`
+
+### DynamoDB Accelerator (DAX)
+
+DAX is an in-memory cache specifically for DynamoDB that is API-compatible — your application uses the DAX client instead of the DynamoDB client, with no other code changes. DAX provides microsecond read latency vs DynamoDB's single-digit millisecond.
+
+**DAX is most valuable when:** the same items are read very frequently (hot items), you need microsecond latency, or read costs are high.
+
+**DAX doesn't help for:** write-heavy workloads (DAX only caches reads), workloads where every read is a unique key (cache never warms up), or when eventual consistency is not acceptable.
+
+\`\`\`bash
+# Create a DAX cluster
+aws dax create-cluster \\
+  --cluster-name prod-dax \\
+  --node-type dax.r4.large \\
+  --replication-factor 3 \\
+  --iam-role-arn arn:aws:iam::123456789012:role/dax-role \\
+  --subnet-group prod-dax-subnet \\
+  --security-group-ids sg-dax
+\`\`\`
+
+## Best Practices
+
+**ElastiCache:** Use encryption in transit and at rest for all production clusters. Set \`maxmemory-policy\` to \`allkeys-lru\` for caching use cases (evict least-recently-used when memory is full). Use multi-AZ with automatic failover.
+
+**DynamoDB:** Design for your access patterns before choosing keys — unlike SQL, you can't easily add indexes later without cost. Use On-Demand capacity for unpredictable workloads; Provisioned + Auto-Scaling for steady-state. Enable point-in-time recovery (PITR) — it costs nothing and gives you 35 days of restore capability.`,
+          interviewQuestions: [
+            {
+              question: "What is DynamoDB single-table design and why is it recommended?",
+              answer: "Single-table design stores all entity types (users, orders, products) in one DynamoDB table, using PK and SK to model relationships. Since DynamoDB has no joins, you can't normalize across tables like SQL. Single-table design allows retrieving related items in a single Query operation — e.g., a user profile and all their orders in one request — which is not possible if they're in separate tables (would require multiple API calls). It also reduces costs (one table = one set of capacity units) and simplifies operations. The tradeoff: it requires upfront design for all access patterns, and adding new access patterns later may require backfilling a GSI.",
+              difficulty: "senior" as const,
+            },
+            {
+              question: "When would you use DynamoDB Streams with Lambda?",
+              answer: "DynamoDB Streams captures every item change (insert, update, delete) with the before and after state. Use it when: you need to trigger side effects on data changes without coupling them to your application code — e.g., send a notification when order status changes to 'shipped', sync data to Elasticsearch for full-text search, update an aggregate counter when a new record is created, or replicate specific changes to another database. Streams enable event-driven architectures where downstream consumers react to changes asynchronously. Each record in the stream is processed at least once, so your Lambda function should be idempotent.",
+              difficulty: "mid" as const,
+            },
+          ],
+        },
+        {
+          id: "redshift-dms",
+          title: "Redshift & Database Migration Service",
+          duration: 45,
+          type: "lesson" as const,
+          description: "Learn Redshift's MPP architecture for data warehousing, Redshift Serverless, Spectrum for S3 queries, and how to migrate databases with minimal downtime using DMS.",
+          content: `# Redshift & Database Migration Service
+
+Not all data problems fit a transactional database. Analytics workloads — aggregating billions of rows, joining large tables, computing business metrics — require a different architecture. Amazon Redshift is AWS's managed data warehouse built for exactly this.
+
+## Amazon Redshift
+
+Redshift is a **massively parallel processing (MPP)** columnar database. It distributes both data and query execution across multiple nodes, then aggregates results. A query that would take minutes on PostgreSQL can run in seconds on a properly sized Redshift cluster.
+
+### Why Columnar Storage Matters for Analytics
+
+Row-oriented databases (PostgreSQL, MySQL) store all columns of a row together. To compute \`SELECT AVG(revenue) FROM sales\`, the database reads every column of every row — most of which are irrelevant.
+
+Columnar databases store each column separately. The same query reads only the \`revenue\` column. For tables with 100 columns, you read ~1% of the data. Combined with compression (similar values in a column compress well), columnar storage often reduces I/O by 10x for analytical queries.
+
+### Redshift Architecture
+
+**Leader node** — Receives queries, builds execution plans, distributes work to compute nodes.
+
+**Compute nodes** — Execute query fragments in parallel. Each node has a local slice of the data. More nodes = more parallelism = faster queries.
+
+**Distribution style** — How data is distributed across nodes:
+- \`EVEN\`: Round-robin distribution. Good for tables not joined frequently.
+- \`KEY\`: Rows with the same value for the distribution key go to the same node. Eliminates data movement for joins on that key.
+- \`ALL\`: Full copy on every node. Good for small dimension tables frequently joined with large fact tables.
+
+**Sort keys** — Like a clustered index. Rows are stored in sort key order, enabling zone maps that skip entire blocks of data for range filters.
+
+\`\`\`sql
+-- Create a fact table with KEY distribution on customer_id
+-- (joins with the customer dimension avoid data shuffling)
+CREATE TABLE sales (
+  sale_id BIGINT,
+  customer_id BIGINT,
+  product_id BIGINT,
+  sale_date DATE,
+  revenue DECIMAL(18,2)
+)
+DISTSTYLE KEY
+DISTKEY (customer_id)
+SORTKEY (sale_date);
+
+-- Small dimension table: ALL distribution (copy to every node)
+CREATE TABLE products (
+  product_id BIGINT,
+  name VARCHAR(256),
+  category VARCHAR(100),
+  price DECIMAL(10,2)
+)
+DISTSTYLE ALL;
+\`\`\`
+
+\`\`\`bash
+# Create a Redshift cluster
+aws redshift create-cluster \\
+  --cluster-identifier prod-warehouse \\
+  --node-type ra3.4xlarge \\
+  --number-of-nodes 4 \\
+  --master-username admin \\
+  --master-user-password mypassword \\
+  --vpc-security-group-ids sg-redshift \\
+  --cluster-subnet-group-name redshift-subnet \\
+  --encrypted \\
+  --port 5439
+\`\`\`
+
+### Redshift Serverless
+
+Redshift Serverless automatically provisions and scales capacity based on query load. You don't manage nodes — you just set a base RPU (Redshift Processing Units) and a maximum. It's billed per second of compute used.
+
+**When to use Serverless:**
+- Irregular query patterns (daily/weekly reports, ad-hoc analytics)
+- Development and testing environments
+- Workloads that don't run 24/7 (Serverless pauses when idle)
+
+\`\`\`bash
+# Create Redshift Serverless namespace and workgroup
+aws redshift-serverless create-namespace \\
+  --namespace-name prod-analytics \\
+  --admin-username admin \\
+  --admin-user-password mypassword
+
+aws redshift-serverless create-workgroup \\
+  --workgroup-name prod-workgroup \\
+  --namespace-name prod-analytics \\
+  --base-capacity 32 \\
+  --max-capacity 128 \\
+  --subnet-ids subnet-a subnet-b \\
+  --security-group-ids sg-redshift
+\`\`\`
+
+### Redshift Spectrum — Query S3 Directly
+
+Spectrum extends Redshift queries to S3. You define external tables pointing to S3 data (Parquet, ORC, CSV, JSON), and Redshift queries them as if they were regular tables. Compute is offloaded to Spectrum's dedicated layer — it doesn't use your cluster nodes for S3 scanning.
+
+**Pattern — tiered data warehouse:**
+- Hot data (last 90 days): in Redshift cluster for fast queries
+- Cold data (90 days+): in S3 as Parquet, queried via Spectrum
+- Never need to delete old data from Redshift — just unload to S3
+
+\`\`\`sql
+-- Create external schema pointing to your Glue catalog
+CREATE EXTERNAL SCHEMA s3_data
+FROM DATA CATALOG
+DATABASE 'analytics-db'
+IAM_ROLE 'arn:aws:iam::123456789012:role/redshift-spectrum-role'
+CREATE EXTERNAL DATABASE IF NOT EXISTS;
+
+-- Query S3 data as if it's a table
+SELECT year, SUM(revenue) as total_revenue
+FROM s3_data.historical_sales
+WHERE year BETWEEN 2019 AND 2022
+GROUP BY year;
+
+-- Join hot (Redshift) and cold (S3) data seamlessly
+SELECT c.customer_name, SUM(s.revenue)
+FROM sales s                          -- Redshift table (recent)
+JOIN s3_data.historical_sales h ON s.customer_id = h.customer_id  -- S3
+JOIN customers c ON c.id = s.customer_id
+GROUP BY c.customer_name;
+\`\`\`
+
+## AWS Database Migration Service (DMS)
+
+DMS migrates databases to AWS with minimal downtime. It supports migrations:
+- Homogeneous: MySQL → RDS MySQL, Oracle → Oracle
+- Heterogeneous: Oracle → Aurora PostgreSQL, SQL Server → MySQL (requires Schema Conversion Tool)
+
+**DMS migration workflow:**
+
+1. **Create a replication instance** — An EC2 instance that runs the migration engine
+2. **Create endpoints** — Source (your existing database) and target (the AWS database)
+3. **Create a migration task** — Full load, CDC (Change Data Capture), or both
+
+**Migration types:**
+- **Full load only** — Dump and restore. Has downtime equal to the transfer duration.
+- **Full load + CDC** — Initial full load, then continuously replicate changes. Allows near-zero-downtime cutover: let DMS catch up to real-time, then flip the connection string.
+- **CDC only** — For ongoing replication after an initial load done by other means.
+
+\`\`\`bash
+# Create a DMS replication instance
+aws dms create-replication-instance \\
+  --replication-instance-identifier prod-migration \\
+  --replication-instance-class dms.r5.large \\
+  --allocated-storage 100 \\
+  --vpc-security-group-ids sg-dms \\
+  --replication-subnet-group-identifier dms-subnet-group \\
+  --publicly-accessible false
+
+# Create source endpoint (on-prem MySQL)
+aws dms create-endpoint \\
+  --endpoint-identifier source-mysql \\
+  --endpoint-type source \\
+  --engine-name mysql \\
+  --server-name db.internal.company.com \\
+  --port 3306 \\
+  --username migrationuser \\
+  --password mysourcepassword \\
+  --database-name production
+
+# Create target endpoint (Aurora MySQL)
+aws dms create-endpoint \\
+  --endpoint-identifier target-aurora \\
+  --endpoint-type target \\
+  --engine-name aurora \\
+  --server-name prod-aurora.cluster-xxx.rds.amazonaws.com \\
+  --port 3306 \\
+  --username admin \\
+  --password mytargetpassword
+
+# Create migration task (full load + ongoing replication)
+aws dms create-replication-task \\
+  --replication-task-identifier prod-migration-task \\
+  --source-endpoint-arn arn:aws:dms:... \\
+  --target-endpoint-arn arn:aws:dms:... \\
+  --replication-instance-arn arn:aws:dms:... \\
+  --migration-type full-load-and-cdc \\
+  --table-mappings file://table-mappings.json \\
+  --replication-task-settings file://task-settings.json
+\`\`\`
+
+### Schema Conversion Tool (SCT)
+
+For heterogeneous migrations (Oracle → PostgreSQL, SQL Server → MySQL), AWS Schema Conversion Tool automatically converts the source schema and 90%+ of stored procedures, functions, and views. Incompatible objects are flagged for manual review.
+
+Run SCT before starting DMS to convert and validate the schema in the target database.
+
+## Best Practices
+
+**Redshift:** Use RA3 instances (compute-storage separated) — you can scale compute independently of storage. Enable automatic table sort and vacuum (Redshift maintains performance automatically). Monitor \`WLM_QUEUE_WAIT\` — long wait times mean you need more WLM queues or more cluster capacity.
+
+**DMS:** Run \`test-connection\` on both endpoints before starting the task. Enable CloudWatch logging on the replication task for debugging. For large tables, use parallel load settings. During CDC, ensure binary logging is enabled on MySQL source (\`binlog_format=ROW\`) or supplemental logging on Oracle.`,
+          interviewQuestions: [
+            {
+              question: "What is the difference between Redshift distribution styles and why do they matter?",
+              answer: "Distribution style determines how Redshift distributes rows across compute nodes. EVEN distributes round-robin — good for tables that aren't joined. KEY distributes rows by a column value so rows with the same key land on the same node — eliminates expensive data shuffling during joins on that key. ALL copies the entire table to every node — ideal for small dimension tables frequently joined with large fact tables. Choosing wrong distribution causes data movement during queries (rows sent between nodes over the network), which is the primary cause of slow Redshift queries. Design distribution keys around your most common join patterns.",
+              difficulty: "senior" as const,
+            },
+            {
+              question: "How does DMS enable near-zero-downtime database migrations?",
+              answer: "DMS uses full-load-and-CDC mode: 1) Full load — DMS copies all existing data from source to target while the source continues accepting writes. 2) CDC (Change Data Capture) — DMS reads the source's transaction log (MySQL binary log, PostgreSQL WAL, Oracle redo log) and replays every change to the target in near real-time. 3) When the target lag drops below a few seconds, you schedule a maintenance window, stop writes to the source, let DMS flush the last few seconds of changes, then switch application connection strings to the target. Total downtime is seconds, not hours. Without CDC, you'd need hours of downtime equal to the full load duration.",
+              difficulty: "senior" as const,
+            },
+          ],
+        },
+      ],
+      exam: [
+        { question: "Your Aurora PostgreSQL writer instance is failing over every few days. How do you investigate?", answer: "1) Check CloudWatch metrics for the writer instance: FreeableMemory (OOM causing crash), CPUUtilization (overload), DatabaseConnections (connection exhaustion). 2) Enable Performance Insights and check the top wait events during the period before failover. 3) Review Aurora Events in the RDS console — events show the exact reason for failover (e.g., 'DB instance restarted' vs 'Failover started'). 4) Check Aurora error logs for PostgreSQL-level errors (out of memory, deadlocks, disk full). 5) If OOM: right-size the instance or reduce max_connections/work_mem. If connection exhaustion: add RDS Proxy. 6) Enable Enhanced Monitoring for OS-level process metrics.", difficulty: "senior" as const },
+        { question: "A DynamoDB table scan is timing out on a 500M item table. What do you do?", answer: "Full table scans on large DynamoDB tables are an anti-pattern. Solutions: 1) Identify the actual access pattern — scans usually mean the table wasn't designed for the query. Add a GSI if you need to query by a non-key attribute. 2) If a scan is unavoidable (migration, one-time analysis), use Parallel Scan: split the table into segments and scan multiple segments concurrently. For 500M items, use 10–50 segments. 3) Use FilterExpression to reduce returned items (though DynamoDB still reads all items before filtering — it only reduces data transfer). 4) For analytics, export the table to S3 using DynamoDB's Point-in-Time Export, then query with Athena. Never use Scan for production read paths.", difficulty: "senior" as const },
+        { question: "How would you design a caching strategy for an API that serves product details read by millions of users daily?", answer: "Use ElastiCache Redis with Cache-Aside pattern: on a cache miss, fetch from Aurora, store in Redis with appropriate TTL (5-30 minutes for product data that changes rarely). Use the product ID as the cache key. For cache invalidation: when a product is updated, delete its cache key immediately rather than waiting for TTL expiry — Redis DEL is O(1). Consider read-through caching for simplicity. For extremely hot items (viral products), add a local in-memory cache in the application (LRU cache, 30-60 second TTL) as an L1 cache before hitting Redis. Monitor the ElastiCache CacheHitRate metric — below 85% indicates the cache is too small or TTLs too short.", difficulty: "mid" as const },
+        { question: "You need to migrate a 5 TB Oracle production database to Aurora PostgreSQL with < 5 minutes downtime. What's your plan?", answer: "1) Run AWS Schema Conversion Tool (SCT) to convert Oracle schema to PostgreSQL. Fix any incompatible objects (custom types, specific PL/SQL). 2) Create the Aurora PostgreSQL cluster in the target region/account. 3) Create DMS endpoints for Oracle source and Aurora target. Create a replication task with full-load-and-cdc mode. 4) Start full load — this takes hours but runs while production is live. 5) After full load, DMS switches to CDC mode, replicating every transaction from Oracle's redo log to Aurora. Monitor lag metric until it's < 1 second consistently. 6) During a maintenance window: stop application writes to Oracle, wait for DMS lag to reach 0, run validation queries to confirm row counts and checksums match, then switch application connection strings to Aurora. Total downtime: seconds to minutes.", difficulty: "senior" as const },
+        { question: "How does Redshift Spectrum differ from loading data into Redshift tables?", answer: "Loading data into Redshift copies it from S3 into Redshift's local storage on compute nodes (COPY command). Queries run entirely on Redshift compute nodes — fast, but you pay for storage and must manage data lifecycle (delete old data or it accumulates costs). Redshift Spectrum queries data directly from S3 without loading it. A separate Spectrum layer (dedicated infrastructure, not your cluster nodes) scans S3 data in parallel. You only pay for data scanned. Best practice: use a tiered approach — load recent 'hot' data into Redshift for fast queries, keep historical 'cold' data in S3 as Parquet, and join both in a single query via Spectrum. This minimizes storage costs while maintaining query capability across all historical data.", difficulty: "senior" as const },
       ],
     },
   ],
