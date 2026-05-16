@@ -1735,5 +1735,720 @@ The \`ACTIONS_STEP_DEBUG\` secret enables verbose logging for every step, showin
         { question: "Your team's integration test suite takes 45 minutes to run in CI. Propose a strategy to bring it under 10 minutes without removing tests.", answer: "45→10 minute reduction requires parallelization and smarter test execution. Strategy: (1) Profile the suite: identify the slowest 20% of tests that account for 80% of time. `pytest --durations=20` or equivalent. (2) Parallelize: split the test suite across multiple CI runners using matrix strategy: `matrix: shard: [1,2,3,4,5]` with pytest-split or similar sharding plugins. 5 parallel runners → 9 min from 45. (3) Eliminate serial bottlenecks: tests waiting for a single shared database can be parallelized with per-worker databases or schemas. (4) Speed up slow individual tests: tests using sleep() for timing should use polling with short intervals. (5) Cache dependencies: Docker layer cache, pip/npm cache between runs — saves 2-5 min. (6) Test impact analysis: only run tests affected by changed code (requires tooling like pytest-testmon or Bazel). (7) Move smoke tests to pre-merge, full suite to post-merge.", difficulty: "senior" },
       ],
     },
+
+{
+  id: "kubernetes-troubleshooting",
+  title: "Kubernetes Troubleshooting",
+  level: "intermediate" as const,
+  description: "Diagnose and fix pod failures, network issues, storage problems, cluster resource exhaustion, and misconfigured workloads in Kubernetes.",
+  lessons: [
+    {
+      id: "pod-failures",
+      title: "Pod Failures: CrashLoopBackOff, OOMKilled & Pending",
+      duration: 50,
+      type: "lesson" as const,
+      description: "Systematically diagnose every pod failure state — CrashLoopBackOff, OOMKilled, ImagePullBackOff, Pending, Evicted — with the exact commands and reasoning for each.",
+      content: `# Pod Failures: Diagnosing Every State
+
+## The First Commands — Always Start Here
+
+\`\`\`bash
+# Get pod status overview
+kubectl get pods -n <namespace>
+
+# Detailed event log — the most useful first step
+kubectl describe pod <pod-name> -n <namespace>
+# Look at the Events section at the bottom — it shows exactly what happened
+
+# Current logs
+kubectl logs <pod-name> -n <namespace>
+
+# Previous container logs (if pod restarted)
+kubectl logs <pod-name> -n <namespace> --previous
+
+# Follow logs in real time
+kubectl logs -f <pod-name> -n <namespace>
+
+# If a pod has multiple containers:
+kubectl logs <pod-name> -c <container-name> -n <namespace>
+\`\`\`
+
+## CrashLoopBackOff
+
+The container starts, crashes, Kubernetes restarts it, it crashes again. The backoff increases (10s → 20s → 40s → ... → 5min) to prevent thrashing.
+
+**Diagnosis:**
+\`\`\`bash
+# See the restart count and last exit code
+kubectl get pod <pod-name> -o jsonpath='{.status.containerStatuses[0].restartCount}'
+kubectl get pod <pod-name> -o jsonpath='{.status.containerStatuses[0].lastState.terminated.exitCode}'
+
+# Read the crash logs from the previous run
+kubectl logs <pod-name> --previous -n <namespace>
+\`\`\`
+
+**Common exit codes:**
+- Exit 0: container exited cleanly — the process finished. Is it a Job or a long-running daemon? A webserver shouldn't exit 0.
+- Exit 1: application error — check logs for stack trace or error message
+- Exit 137: OOMKilled (128 + signal 9) — container exceeded memory limit
+- Exit 139: Segmentation fault
+- Exit 143: SIGTERM not handled — container didn't shut down gracefully
+
+**Common causes and fixes:**
+\`\`\`bash
+# 1. Missing environment variable
+# Logs say: "Error: DATABASE_URL is required"
+# Fix: check the deployment's env section
+kubectl get deployment myapp -o yaml | grep -A 20 env:
+
+# 2. Bad startup command
+kubectl get pod <pod-name> -o jsonpath='{.spec.containers[0].command}'
+kubectl get pod <pod-name> -o jsonpath='{.spec.containers[0].args}'
+
+# 3. Application can't connect to dependency on startup
+# Pod crashes because DB isn't ready yet
+# Fix: add an initContainer to wait
+initContainers:
+- name: wait-for-db
+  image: busybox
+  command: ['sh', '-c', 'until nc -z postgres-service 5432; do sleep 2; done']
+\`\`\`
+
+## OOMKilled — Out of Memory
+
+The container used more memory than its limit allowed. The kernel's OOM killer terminated it with SIGKILL (unblockable).
+
+\`\`\`bash
+# Confirm OOMKill
+kubectl get pod <pod-name> -o jsonpath='{.status.containerStatuses[0].lastState.terminated.reason}'
+# Output: OOMKilled
+
+# Check current limits vs actual usage
+kubectl top pod <pod-name> -n <namespace> --containers
+kubectl describe pod <pod-name> | grep -A 5 Limits:
+
+# Check node memory pressure
+kubectl describe node <node-name> | grep -A 10 Conditions:
+\`\`\`
+
+**Fix options:**
+\`\`\`yaml
+# Increase memory limit
+resources:
+  requests:
+    memory: "256Mi"
+  limits:
+    memory: "512Mi"   # was 256Mi — increase to 512Mi
+
+# Or: fix the memory leak in the application
+# Use kubectl exec to run memory profiling tools inside the container:
+kubectl exec -it <pod-name> -- /bin/sh
+# Then run: ps aux, or language-specific profiler
+\`\`\`
+
+## ImagePullBackOff / ErrImagePull
+
+Kubernetes can't pull the container image.
+
+\`\`\`bash
+kubectl describe pod <pod-name> | grep -A 5 "Failed\|Error\|Back-off"
+\`\`\`
+
+**Common causes:**
+\`\`\`bash
+# 1. Image doesn't exist or typo in tag
+kubectl get pod <pod-name> -o jsonpath='{.spec.containers[0].image}'
+# Verify: docker pull <that-image>
+
+# 2. Private registry — missing imagePullSecret
+kubectl get pod <pod-name> -o jsonpath='{.spec.imagePullSecrets}'
+# Should show the secret name; if empty, add it:
+kubectl patch serviceaccount default -p '{"imagePullSecrets": [{"name": "registry-credentials"}]}'
+
+# 3. Create registry credentials secret
+kubectl create secret docker-registry registry-credentials \\
+  --docker-server=ghcr.io \\
+  --docker-username=myuser \\
+  --docker-password=\$GITHUB_TOKEN \\
+  --namespace myapp
+
+# 4. Node can't reach the registry (network policy or firewall)
+# Test by exec into a debug pod on the same node:
+kubectl debug node/<node-name> -it --image=ubuntu
+\`\`\`
+
+## Pending Pods — Never Scheduled
+
+A pod stuck in Pending means the scheduler can't find a node to place it on.
+
+\`\`\`bash
+# The Events section will show the exact scheduling failure
+kubectl describe pod <pod-name> | grep -A 20 Events:
+\`\`\`
+
+**Insufficient resources:**
+\`\`\`bash
+# 0/3 nodes available: 3 Insufficient cpu
+# Check node capacity and what's allocated
+kubectl describe node <node-name> | grep -A 10 "Allocated resources"
+
+# Check all node resources
+kubectl top nodes
+
+# Find pods consuming the most resources
+kubectl top pods -A --sort-by=cpu | head -20
+\`\`\`
+
+**Node selector / affinity mismatch:**
+\`\`\`bash
+# Pod requires a label the node doesn't have
+kubectl get pod <pod-name> -o jsonpath='{.spec.nodeSelector}'
+kubectl get nodes --show-labels | grep <required-label>
+
+# Fix: remove nodeSelector or add the label to a node
+kubectl label node <node-name> disktype=ssd
+\`\`\`
+
+**Taints and tolerations:**
+\`\`\`bash
+# Node has a taint the pod doesn't tolerate
+kubectl describe node <node-name> | grep Taints:
+kubectl get pod <pod-name> -o jsonpath='{.spec.tolerations}'
+
+# Add toleration to pod spec:
+tolerations:
+- key: "dedicated"
+  operator: "Equal"
+  value: "gpu"
+  effect: "NoSchedule"
+\`\`\`
+
+**PersistentVolumeClaim not bound:**
+\`\`\`bash
+# Pod won't schedule until its PVC is bound
+kubectl get pvc -n <namespace>
+# STATUS must be Bound, not Pending
+
+kubectl describe pvc <pvc-name>
+# Events will show why it's not binding:
+# - No PersistentVolume available with matching StorageClass
+# - StorageClass doesn't have a provisioner
+# - Requested size > available PV size
+\`\`\`
+
+## Evicted Pods
+
+Kubernetes evicts pods when a node runs low on resources (memory, disk).
+
+\`\`\`bash
+kubectl get pods -A | grep Evicted
+
+# See eviction reason
+kubectl describe pod <evicted-pod> | grep "Message:"
+
+# Clean up evicted pods
+kubectl get pods -A | grep Evicted | awk '{print $1" "$2}' | xargs -n2 kubectl delete pod -n
+\`\`\`
+
+Evictions happen when node conditions trigger: MemoryPressure, DiskPressure. Prevent by setting proper resource requests (so the scheduler avoids overpacking nodes) and using PodDisruptionBudgets.
+
+## Debugging a Running Pod
+
+\`\`\`bash
+# Shell into a running container
+kubectl exec -it <pod-name> -n <namespace> -- /bin/sh
+
+# If the container doesn't have a shell (distroless image), use ephemeral debug containers
+kubectl debug -it <pod-name> --image=ubuntu --target=<container-name>
+
+# Copy files from a pod to local (for log collection)
+kubectl cp <pod-name>:/var/log/app/error.log ./error.log
+
+# Port-forward to access the pod directly (bypassing service/ingress)
+kubectl port-forward pod/<pod-name> 8080:8080
+curl http://localhost:8080/health
+\`\`\``,
+      interviewQuestions: [
+        {
+          question: "A pod is in CrashLoopBackOff. Walk through your diagnosis steps.",
+          answer: "1) 'kubectl describe pod <name>' — read the Events section for the immediate failure cause. 2) 'kubectl logs <name> --previous' — read logs from the crashed container (the current container may not have any logs yet). 3) Check the exit code: 'kubectl get pod <name> -o jsonpath={.status.containerStatuses[0].lastState.terminated.exitCode}'. Exit 137 = OOMKilled, Exit 1 = app error, Exit 0 = process exited cleanly (not a daemon?). 4) Check if the container can even start: is the image correct? Are all required env vars set? 5) Use 'kubectl exec' or an ephemeral debug container if the pod is briefly Running before crashing. 6) Check if an initContainer is failing: 'kubectl logs <pod> -c <initcontainer-name>'.",
+          difficulty: "junior" as const,
+        },
+      ],
+    },
+    {
+      id: "k8s-networking-storage-debug",
+      title: "Kubernetes Networking, Storage & Cluster Issues",
+      duration: 50,
+      type: "lesson" as const,
+      description: "Debug Kubernetes network policies blocking traffic, DNS failures, Ingress misconfigurations, PVC binding issues, and cluster-level problems.",
+      content: `# Kubernetes Networking, Storage & Cluster Issues
+
+## Diagnosing Network Connectivity Between Pods
+
+\`\`\`bash
+# Can pod A reach pod B? Run a test from inside pod A:
+kubectl exec -it <pod-a> -- curl -sv http://<pod-b-service>:<port>/health
+
+# DNS resolution — can pods resolve service names?
+kubectl exec -it <pod-a> -- nslookup <service-name>.<namespace>.svc.cluster.local
+
+# Test raw TCP connectivity
+kubectl exec -it <pod-a> -- nc -zv <service-name> 5432
+
+# Check service endpoints — is the service pointing to healthy pods?
+kubectl get endpoints <service-name> -n <namespace>
+# If ENDPOINTS is <none>, the service selector doesn't match any pod labels
+kubectl get pods -l <selector-from-service> -n <namespace>
+\`\`\`
+
+**Service selector mismatch** — the #1 cause of "connection refused" to a service:
+\`\`\`bash
+# Check service selector
+kubectl get service myapp -o jsonpath='{.spec.selector}'
+# Output: {"app":"myapp","version":"v2"}
+
+# Check pod labels
+kubectl get pods -l app=myapp --show-labels
+# If pods have app=myapp but not version=v2, the service won't select them
+
+# Fix: update the service selector or add the label to pods
+kubectl label pod <pod-name> version=v2
+\`\`\`
+
+## Network Policies Blocking Traffic
+
+NetworkPolicies are deny-by-default when applied. A pod with ANY NetworkPolicy applied to it will deny all traffic not explicitly allowed.
+
+\`\`\`bash
+# Check if NetworkPolicies exist in the namespace
+kubectl get networkpolicies -n <namespace>
+
+# Describe a policy to understand its rules
+kubectl describe networkpolicy <policy-name> -n <namespace>
+
+# Common mistake: policy allows ingress from namespace A but the pod
+# trying to connect is in namespace B
+# Fix: add a namespace selector to the ingress rule:
+ingress:
+- from:
+  - namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: allowed-namespace
+  - podSelector:
+      matchLabels:
+        role: frontend
+
+# Test with a debug pod that has network tools
+kubectl run debug --image=nicolaka/netshoot -it --rm -- bash
+# Inside: curl, nmap, tcpdump, nslookup, dig all available
+\`\`\`
+
+## Ingress Not Working
+
+\`\`\`bash
+# Check Ingress resource is configured correctly
+kubectl describe ingress <ingress-name> -n <namespace>
+# Look for Events — ingress controller logs events here on error
+
+# Check the ingress controller pods are running
+kubectl get pods -n ingress-nginx   # or kube-system for traefik, etc.
+kubectl logs -n ingress-nginx deploy/ingress-nginx-controller | tail -50
+
+# Check the backend service is reachable from the ingress controller
+kubectl exec -n ingress-nginx deploy/ingress-nginx-controller -- \\
+  curl -sv http://<service-name>.<namespace>.svc.cluster.local:<port>/health
+
+# Common issues:
+# 1. Service port mismatch — Ingress backend.port must match Service port, not containerPort
+# 2. Missing ingressClassName — newer Kubernetes requires: ingressClassName: nginx
+# 3. TLS secret missing or in wrong namespace
+kubectl get secret <tls-secret-name> -n <namespace>
+
+# Check if the Ingress has an address assigned (LoadBalancer IP)
+kubectl get ingress <name> -n <namespace>
+# ADDRESS column should show an IP — if empty, LoadBalancer service isn't getting an IP
+\`\`\`
+
+## DNS Failures in Kubernetes
+
+\`\`\`bash
+# CoreDNS pods running?
+kubectl get pods -n kube-system -l k8s-app=kube-dns
+
+# Test DNS from a pod
+kubectl exec -it <pod> -- nslookup kubernetes.default.svc.cluster.local
+# Should return: 10.96.0.1 (cluster IP of kubernetes service)
+
+# DNS not resolving: check CoreDNS logs
+kubectl logs -n kube-system -l k8s-app=kube-dns --tail=50
+
+# Check CoreDNS ConfigMap for forwarding rules
+kubectl get configmap coredns -n kube-system -o yaml
+
+# Common DNS issues:
+# 1. Pod's dnsPolicy is wrong — should be ClusterFirst for service discovery
+kubectl get pod <pod> -o jsonpath='{.spec.dnsPolicy}'
+
+# 2. ndots:5 causes slow lookups — every name without 5 dots tries multiple search domains
+# Add to pod spec for performance:
+dnsConfig:
+  options:
+  - name: ndots
+    value: "1"
+\`\`\`
+
+## PersistentVolume & Storage Issues
+
+\`\`\`bash
+# PVC stuck in Pending
+kubectl describe pvc <pvc-name> -n <namespace>
+# Events will show the cause
+
+# Common causes:
+# 1. No matching PV (for static provisioning)
+kubectl get pv   # check available PVs, their StorageClass, and capacity
+
+# 2. StorageClass doesn't exist
+kubectl get storageclass
+kubectl get pvc <name> -o jsonpath='{.spec.storageClassName}'
+
+# 3. Dynamic provisioner not running
+kubectl get pods -n kube-system | grep provisioner
+
+# Pod stuck because PVC is in a different zone than the node
+# EBS volumes are zone-specific — pod must run in same AZ as volume
+kubectl get pv <pv-name> -o jsonpath='{.metadata.labels}'
+kubectl describe node <node-name> | grep topology.kubernetes.io/zone
+
+# Volume mount errors in pod
+kubectl describe pod <pod> | grep -A 10 "Warning\|MountVolume"
+# "Multi-Attach error" = EBS volume already mounted to another node
+# Fix: ensure the old pod is fully terminated before new one starts
+\`\`\`
+
+## Cluster-Level Issues
+
+**Node NotReady:**
+\`\`\`bash
+kubectl get nodes
+# Status: NotReady
+
+kubectl describe node <node-name>
+# Check Conditions section:
+# MemoryPressure, DiskPressure, PIDPressure, Ready
+
+# SSH to the node and check kubelet
+systemctl status kubelet
+journalctl -u kubelet --since "10 minutes ago" | tail -50
+
+# Common causes:
+# 1. Disk pressure — node disk is full
+df -h   # check /var/lib/docker or /var/lib/containerd
+# Fix: docker system prune or increase disk
+# 2. kubelet certificate expired
+ls -la /var/lib/kubelet/pki/
+# 3. Node lost network connectivity to control plane
+\`\`\`
+
+**API server unreachable:**
+\`\`\`bash
+# Check control plane components
+kubectl get pods -n kube-system
+# etcd, kube-apiserver, kube-controller-manager, kube-scheduler
+
+# Managed clusters (EKS, GKE, AKS) — check cloud console for control plane health
+aws eks describe-cluster --name my-cluster --query cluster.status
+
+# Check kubeconfig is correct
+kubectl cluster-info
+kubectl config current-context
+\`\`\`
+
+**Resource quota exhausted:**
+\`\`\`bash
+kubectl describe resourcequota -n <namespace>
+# Shows: hard limits vs used — if used == hard, new pods won't schedule
+
+# Increase quota or clean up unused resources
+kubectl delete pods --field-selector=status.phase=Succeeded -n <namespace>
+kubectl delete pods --field-selector=status.phase=Failed -n <namespace>
+\`\`\``,
+      interviewQuestions: [
+        {
+          question: "A Kubernetes service has endpoints but pods can't connect to it. What do you check?",
+          answer: "1) Verify the service type and port mapping: 'kubectl get service <name> -o yaml' — check that the port and targetPort match what the container is actually listening on. 2) Check NetworkPolicies: any policy applied to the destination pod may be blocking the source. 'kubectl get networkpolicies -n <ns>' and check if the source pod's labels match the ingress rules. 3) Verify the pod is actually listening: 'kubectl exec <dest-pod> -- ss -tlnp | grep <port>'. 4) Test directly to the pod IP bypassing the service: 'kubectl exec <source-pod> -- curl <pod-ip>:<port>' — if this works but the service doesn't, the issue is in the service layer. 5) Check if kube-proxy is running: 'kubectl get pods -n kube-system | grep kube-proxy'.",
+          difficulty: "senior" as const,
+        },
+      ],
+    },
+  ],
+  exam: [
+    { question: "All pods in a namespace are stuck in Pending and 'kubectl describe pod' shows '0/3 nodes are available: 3 node(s) had untolerated taint {node.kubernetes.io/not-ready: NoSchedule}'. What happened and how do you fix it?", answer: "All 3 nodes have entered a NotReady state, and Kubernetes automatically adds the 'node.kubernetes.io/not-ready' taint to prevent new scheduling. Fix: 1) Check node status: 'kubectl get nodes' — all should show NotReady. 2) Investigate the cause: 'kubectl describe node <node>' — look at Conditions and Events. 3) SSH to the nodes and check kubelet: 'systemctl status kubelet' and 'journalctl -u kubelet --since \"30 minutes ago\"'. Common causes: node disk full (df -h), kubelet crash, network partition from control plane, certificate expiry. 4) Fix the root cause (clear disk, restart kubelet, restore network). 5) Once nodes return to Ready, the taint is automatically removed and pods reschedule.", difficulty: "senior" as const },
+    { question: "A pod starts successfully but after 2 minutes it becomes CrashLoopBackOff. The logs show 'connection to database lost'. What do you investigate?", answer: "The pod starts fine (DB connection works initially) but loses connectivity after ~2 minutes — classic connection pool exhaustion or network timeout issue. Investigate: 1) Is the database actually dropping connections? Check DB logs and active connections: 'SELECT count(*) FROM pg_stat_activity' — at max_connections, new connections are refused. 2) Is there a connection leak in the app? The app opens connections but never closes them. 3) Check if a NetworkPolicy with a TCP idle timeout is killing connections — some CNI implementations have 2-minute idle timeouts. 4) Check if the DB service in Kubernetes is pointing to the right pod: 'kubectl get endpoints db-service'. 5) Add RDS Proxy or PgBouncer to pool connections. 6) Set TCP keepalive in the application connection string.", difficulty: "mid" as const },
+  ],
+},
+
+{
+  id: "performance-database-troubleshooting",
+  title: "Performance & Database Troubleshooting",
+  level: "advanced" as const,
+  description: "Profile and fix CPU and memory bottlenecks, diagnose slow database queries, investigate memory leaks, and use system-level tools to find performance root causes.",
+  lessons: [
+    {
+      id: "performance-profiling",
+      title: "Performance Profiling: CPU, Memory & Latency",
+      duration: 50,
+      type: "lesson" as const,
+      description: "Use Linux profiling tools, language-specific profilers, and distributed tracing to find and fix CPU bottlenecks, memory leaks, and latency spikes.",
+      content: `# Performance Profiling: CPU, Memory & Latency
+
+## System-Level Profiling
+
+Before profiling an application, confirm the system itself isn't the bottleneck:
+
+\`\`\`bash
+# CPU — what's consuming it?
+top -b -n1 | head -20        # snapshot
+htop                          # interactive, per-core view
+
+# Load average vs CPU count
+uptime
+# load average: 3.5, 2.1, 1.8
+# On a 4-core machine: 3.5 = 87% utilization (fine)
+# On a 2-core machine: 3.5 = 175% (overloaded — queue of waiting processes)
+
+# CPU steal (for VMs) — CPU time stolen by the hypervisor
+# High steal means you're on a noisy neighbour and need a dedicated instance
+vmstat 1 10 | awk '{print $16}' | tail -10   # steal column
+
+# I/O wait — CPU idle but waiting for disk
+iostat -x 1 5
+# %iowait high = disk bottleneck, not CPU
+# %util near 100% on a device = that device is saturated
+
+# Memory
+free -h
+# Check available (not just free — available includes reclaimable cache)
+cat /proc/meminfo | grep -E "MemTotal|MemFree|MemAvailable|SwapUsed"
+
+# Is the system swapping? (very bad for latency)
+vmstat 1 | awk '{print $7,$8}'   # si=swap in, so=swap out (should be 0)
+
+# Disk I/O per process
+iotop -ob -n5    # top-like for disk I/O
+\`\`\`
+
+## Finding Slow Functions with perf (Linux)
+
+\`\`\`bash
+# CPU flame graph — shows where CPU time is spent
+# Record CPU samples for 30 seconds on process PID 1234
+perf record -F 99 -p 1234 -g --call-graph dwarf -- sleep 30
+perf script | stackcollapse-perf.pl | flamegraph.pl > flamegraph.svg
+
+# Quick top functions (no flame graph)
+perf top -p 1234
+
+# For Go: built-in pprof
+# Add to your Go HTTP server:
+import _ "net/http/pprof"
+# Then:
+go tool pprof http://localhost:6060/debug/pprof/profile?seconds=30
+# In pprof interactive mode:
+(pprof) top20        # top 20 CPU-consuming functions
+(pprof) web          # open flame graph in browser (requires graphviz)
+
+# For Python: py-spy (zero-overhead sampling profiler)
+py-spy top --pid 1234               # live top-like view
+py-spy record --output profile.svg --pid 1234  # flame graph
+\`\`\`
+
+## Memory Leak Detection
+
+A memory leak causes memory usage to grow continuously until OOMKill or swap exhaustion.
+
+\`\`\`bash
+# Watch memory growth over time
+watch -n5 'ps -p <PID> -o pid,rss,vsz --no-headers'
+# RSS growing continuously = leak
+
+# For Go: heap profiling
+go tool pprof http://localhost:6060/debug/pprof/heap
+(pprof) top20    # objects and memory by allocation site
+(pprof) list <function>  # show allocations in specific function
+
+# For Node.js: heap snapshot
+node --inspect app.js
+# Open chrome://inspect in Chrome
+# Memory tab → Take heap snapshot → Compare snapshots over time
+# Objects growing between snapshots = leaked
+
+# For Python: tracemalloc
+import tracemalloc
+tracemalloc.start()
+# ... run code ...
+snapshot = tracemalloc.take_snapshot()
+top_stats = snapshot.statistics('lineno')
+for stat in top_stats[:10]:
+    print(stat)
+
+# For Java: heap dump analysis
+jmap -dump:format=b,file=heap.bin <PID>
+# Open heap.bin in Eclipse Memory Analyzer (MAT) or VisualVM
+# Look for Retained Heap — objects holding large amount of memory alive
+\`\`\`
+
+## Latency Investigation — P99 Spikes
+
+High average latency is often different from P99 spikes. P99 spikes (the worst 1% of requests) can indicate:
+
+\`\`\`bash
+# Find slow requests in nginx/apache logs
+awk '$NF > 1.0 {print}' /var/log/nginx/access.log | sort -k$NF -n | tail -20
+# Prints requests taking > 1 second
+
+# Analyze latency distribution from log files
+awk '{print $NF}' /var/log/nginx/access.log | sort -n | \\
+  awk 'BEGIN{c=0} {a[c++]=$1} END{
+    print "p50:", a[int(c*0.5)];
+    print "p90:", a[int(c*0.9)];
+    print "p95:", a[int(c*0.95)];
+    print "p99:", a[int(c*0.99)]
+  }'
+\`\`\`
+
+**Garbage Collection pauses** cause P99 spikes:
+\`\`\`bash
+# Java GC logs
+java -Xlog:gc*:file=gc.log:time,uptime:filecount=5,filesize=20m -jar app.jar
+
+# Check for long GC pauses
+grep -E "Pause|pause" gc.log | awk '{print $NF}' | sort -n | tail -10
+
+# Go GC trace
+GODEBUG=gctrace=1 ./myapp 2>&1 | grep "^gc"
+# Each line shows: gc N @Xs heap: XMB->XMB, wall: Xms
+# "wall" is the STW pause time — should be < 1ms for most workloads
+\`\`\`
+
+## Database Slow Query Analysis
+
+\`\`\`sql
+-- PostgreSQL: find the slowest queries
+SELECT
+  mean_exec_time,
+  calls,
+  total_exec_time,
+  rows,
+  query
+FROM pg_stat_statements
+ORDER BY mean_exec_time DESC
+LIMIT 10;
+
+-- Enable pg_stat_statements (requires restart or ALTER SYSTEM)
+ALTER SYSTEM SET shared_preload_libraries = 'pg_stat_statements';
+
+-- Find queries doing sequential scans on large tables
+SELECT
+  schemaname,
+  tablename,
+  seq_scan,
+  seq_tup_read,
+  idx_scan
+FROM pg_stat_user_tables
+WHERE seq_scan > idx_scan
+  AND n_live_tup > 10000
+ORDER BY seq_scan DESC;
+
+-- Find missing indexes (tables with many seq scans and large row counts)
+SELECT
+  tablename,
+  seq_scan,
+  n_live_tup,
+  seq_tup_read / NULLIF(seq_scan, 0) as avg_rows_per_scan
+FROM pg_stat_user_tables
+ORDER BY seq_tup_read DESC
+LIMIT 10;
+
+-- Check lock waits (queries waiting on locks)
+SELECT
+  blocked.pid,
+  blocked.query,
+  blocking.pid as blocking_pid,
+  blocking.query as blocking_query,
+  now() - blocked.query_start as blocked_duration
+FROM pg_stat_activity blocked
+JOIN pg_stat_activity blocking ON blocking.pid = ANY(pg_blocking_pids(blocked.pid))
+WHERE cardinality(pg_blocking_pids(blocked.pid)) > 0;
+
+-- Kill a blocking query (with care in production)
+SELECT pg_terminate_backend(<blocking_pid>);
+\`\`\`
+
+**EXPLAIN ANALYZE — read it correctly:**
+\`\`\`sql
+EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
+SELECT u.name, COUNT(o.id)
+FROM users u
+JOIN orders o ON o.user_id = u.id
+WHERE u.created_at > '2024-01-01'
+GROUP BY u.id;
+
+-- Key things to look for:
+-- "Seq Scan" on a large table = missing index
+-- "actual rows=1000000 rows=10 estimated" = bad statistics, run ANALYZE
+-- "Buffers: shared read=50000" = reading 400MB from disk (cache miss)
+-- "Hash Join" vs "Nested Loop" — Hash Join is better for large tables
+-- "Sort" without "Index Scan" = missing index for ORDER BY column
+\`\`\`
+
+## Distributed Tracing for Microservices Latency
+
+When latency is high but individual services look fine, the slowness is in the network or a specific service in the call chain:
+
+\`\`\`python
+# OpenTelemetry Python — instrument your service
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+
+provider = TracerProvider()
+provider.add_span_processor(
+    BatchSpanProcessor(OTLPSpanExporter(endpoint="http://otel-collector:4317"))
+)
+trace.set_tracer_provider(provider)
+
+tracer = trace.get_tracer(__name__)
+
+def process_order(order_id: str):
+    with tracer.start_as_current_span("process_order") as span:
+        span.set_attribute("order.id", order_id)
+
+        with tracer.start_as_current_span("fetch_from_db"):
+            order = db.get_order(order_id)  # this span shows DB time
+
+        with tracer.start_as_current_span("call_payment_service"):
+            result = payment_client.charge(order)  # this span shows payment API time
+
+        span.set_attribute("order.total", float(order.total))
+        return result
+\`\`\`
+
+View traces in Jaeger or Grafana Tempo — the waterfall diagram shows exactly which service or operation is slow in the chain.`,
+      interviewQuestions: [
+        {
+          question: "An API has normal P50 latency (50ms) but P99 is 5 seconds. What are the likely causes and how do you investigate?",
+          answer: "P99 spikes with normal median indicate tail latency caused by intermittent events, not a general slowdown. Likely causes: 1) GC pauses — JVM, Go, or Ruby GC stop-the-world events. Check GC logs for pause duration correlating with the latency spikes. 2) Database lock contention — slow queries occasionally block others. Check pg_stat_activity for blocking queries. 3) Connection pool exhaustion — at peak load, requests queue for a connection. Monitor connection pool wait time. 4) Noisy neighbour / CPU steal — VM sharing a hypervisor occasionally gets CPU stolen. Check steal% in vmstat. 5) Cold cache — specific endpoints hitting cache misses. Correlate timing with cache hit rate metrics. Investigate by enabling distributed tracing (Jaeger/Zipkin) and correlating slow traces with system metrics at the same timestamp.",
+          difficulty: "senior" as const,
+        },
+      ],
+    },
+  ],
+  exam: [
+    { question: "An application's memory usage grows from 200MB to 2GB over 6 hours then crashes with OOMKill. How do you diagnose the leak?", answer: "This is a classic memory leak — gradual growth to OOMKill. Diagnosis: 1) Enable heap profiling before the next instance starts. For Java: add '-Xlog:gc*' and trigger heap dumps periodically with 'jmap -dump'. For Go: expose pprof endpoint and capture 'heap' profiles every 30 minutes. For Node.js: use '--expose-gc' and trigger heap snapshots. 2) Compare heap snapshots taken 1 hour apart — look for object count growing without bound. 3) Correlate growth rate with traffic: does memory grow faster under load? Is it linear with requests? 4) Check for accumulated collections: event listeners not being removed, caches without size limits (Map/dict growing forever), connection pools not closing connections. 5) Check third-party libraries — many leak memory on specific usage patterns. Search GitHub issues for the library + 'memory leak'.", difficulty: "senior" as const },
+    { question: "Database queries are suddenly slow after a deployment that had no schema changes. What do you investigate?", answer: "No schema changes but sudden slowdown points to: 1) Data volume change — the deployment included a data migration that inserted millions of rows, making previously-fast queries slow without new indexes. Check 'SELECT reltuples FROM pg_class WHERE relname = \"table_name\"' to see row count change. 2) Stale statistics — new data distribution caused the planner to choose a wrong plan. Run 'ANALYZE table_name' to update statistics. 3) New code path doing an inefficient query — the deployment changed application code that generates different SQL. Check pg_stat_statements for new slow queries. 4) Connection pool changes — new deployment increased connection count and they're competing. Check 'SELECT count(*) FROM pg_stat_activity'. 5) Autovacuum triggered by large data change — autovacuum lock can slow writes temporarily. Check pg_stat_activity for autovacuum processes.", difficulty: "senior" as const },
+  ],
+},
   ],
 };

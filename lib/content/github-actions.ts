@@ -1069,5 +1069,909 @@ jobs:
         { question: "You want to automatically tag and release your app whenever a version tag like `v1.2.3` is pushed. Sketch the workflow trigger and key steps.", answer: "Trigger: `on: push: tags: ['v[0-9]+.[0-9]+.[0-9]+']`. Key steps: 1. `actions/checkout@v4` to get the code. 2. Build the application (compile, package, Docker image). 3. Extract the version: `VERSION=${{ github.ref_name }}` (gives `v1.2.3`). 4. Create a GitHub Release using `gh release create $VERSION --generate-notes` (auto-generates release notes from PRs merged since last tag) with `env: GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}` and `permissions: contents: write`. 5. Optionally upload build artifacts to the release or push Docker image tagged with the version to ghcr.io.", difficulty: "mid" },
       ],
     },
+
+{
+  id: "docker-registry-workflows",
+  title: "Docker & Registry Workflows",
+  level: "intermediate" as const,
+  description: "Build production-grade Docker CI workflows — layer caching, multi-arch builds, pushing to GHCR and ECR, image signing, and vulnerability scanning.",
+  lessons: [
+    {
+      id: "docker-build-push",
+      title: "Building & Pushing Docker Images",
+      duration: 45,
+      type: "lesson" as const,
+      description: "Master docker/build-push-action with BuildKit cache, multi-platform builds, GitHub Container Registry, and ECR — with image signing using cosign.",
+      content: `# Building & Pushing Docker Images in GitHub Actions
+
+## The Standard Docker Build Workflow
+
+A minimal but production-worthy Docker build job:
+
+\`\`\`yaml
+name: Build & Push
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: \${{ github.repository }}   # e.g. myorg/myapp
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write       # required to push to GHCR
+      id-token: write       # required for cosign OIDC signing
+
+    outputs:
+      image-digest: \${{ steps.build.outputs.digest }}
+      image-tag: \${{ steps.meta.outputs.tags }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Set up Docker Buildx (required for caching and multi-arch)
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Log in to GitHub Container Registry
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: \${{ env.REGISTRY }}
+          username: \${{ github.actor }}
+          password: \${{ secrets.GITHUB_TOKEN }}
+
+      # Generate tags and labels from git context
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: \${{ env.REGISTRY }}/\${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=sha-          # sha-abc1234
+            type=ref,event=branch         # main
+            type=semver,pattern={{version}} # v1.2.3 from tags
+            type=raw,value=latest,enable=\${{ github.ref == 'refs/heads/main' }}
+
+      # Build and push with layer caching
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: \${{ github.event_name != 'pull_request' }}  # push only on merge
+          tags: \${{ steps.meta.outputs.tags }}
+          labels: \${{ steps.meta.outputs.labels }}
+          cache-from: type=gha                 # restore cache from GitHub Actions cache
+          cache-to: type=gha,mode=max          # save all layers to cache
+
+      # Sign the image with cosign (supply chain security)
+      - name: Sign image with cosign
+        if: github.event_name != 'pull_request'
+        uses: sigstore/cosign-installer@v3
+      - run: |
+          cosign sign --yes \${{ env.REGISTRY }}/\${{ env.IMAGE_NAME }}@\${{ steps.build.outputs.digest }}
+        if: github.event_name != 'pull_request'
+        env:
+          COSIGN_EXPERIMENTAL: 1
+\`\`\`
+
+## Layer Caching Strategies
+
+Cache misses are the #1 cause of slow Docker builds. GitHub Actions supports two caching backends:
+
+**GitHub Actions Cache (type=gha)** — Free, stored in GitHub's cache service. Max 10 GB per repo. Best for most teams:
+\`\`\`yaml
+cache-from: type=gha
+cache-to: type=gha,mode=max   # mode=max caches ALL layers, not just final stage
+\`\`\`
+
+**Registry Cache (type=registry)** — Pushes cache layers to a registry. Survives runner restarts, shared across all runners. Better for large teams or expensive builds:
+\`\`\`yaml
+cache-from: type=registry,ref=ghcr.io/myorg/myapp:buildcache
+cache-to: type=registry,ref=ghcr.io/myorg/myapp:buildcache,mode=max
+\`\`\`
+
+**Cache invalidation**: Docker invalidates layer cache when any instruction or its context changes. Order your Dockerfile so infrequently-changing layers (OS packages, runtime) come before frequently-changing layers (app code):
+
+\`\`\`dockerfile
+# Good: deps layer cached until package.json changes
+FROM node:20-alpine
+WORKDIR /app
+COPY package*.json ./          # copy only package files first
+RUN npm ci --production        # this layer cached until package.json changes
+COPY . .                       # app code — changes every commit, but layer above is cached
+RUN npm run build
+\`\`\`
+
+## Multi-Platform / Multi-Arch Builds
+
+GitHub-hosted runners are x86_64. To build ARM64 images (for Graviton EC2, Apple Silicon local dev, Raspberry Pi):
+
+\`\`\`yaml
+- name: Set up QEMU (required for cross-compilation)
+  uses: docker/setup-qemu-action@v3
+  with:
+    platforms: linux/arm64
+
+- name: Set up Buildx
+  uses: docker/setup-buildx-action@v3
+
+- name: Build multi-arch
+  uses: docker/build-push-action@v5
+  with:
+    platforms: linux/amd64,linux/arm64
+    push: true
+    tags: ghcr.io/myorg/myapp:latest
+    cache-from: type=gha
+    cache-to: type=gha,mode=max
+\`\`\`
+
+QEMU emulates ARM64 on the x86_64 runner — it's slow (~3-5x slower for compilation). For production, use native ARM64 runners (GitHub offers arm64 runners in some tiers, or use self-hosted Graviton EC2 instances).
+
+## Pushing to Amazon ECR
+
+\`\`\`yaml
+jobs:
+  build-ecr:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write    # OIDC
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/github-actions-ecr
+          aws-region: us-east-1
+
+      - name: Log in to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push to ECR
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            \${{ steps.login-ecr.outputs.registry }}/myapp:\${{ github.sha }}
+            \${{ steps.login-ecr.outputs.registry }}/myapp:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+\`\`\`
+
+## Container Vulnerability Scanning
+
+Scan the built image before pushing or before deploying:
+
+\`\`\`yaml
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ghcr.io/myorg/myapp:\${{ github.sha }}
+          format: sarif
+          output: trivy-results.sarif
+          exit-code: '1'            # fail if critical CVEs found
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true      # skip CVEs with no fix available
+
+      - name: Upload Trivy results to Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()               # upload even if scan failed
+        with:
+          sarif_file: trivy-results.sarif
+\`\`\`
+
+## Connecting Build to Deploy
+
+Pass the image digest (immutable) between jobs — not the tag (which can be reassigned):
+
+\`\`\`yaml
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Deploy to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          service: my-service
+          cluster: production
+          # Use the digest from the build job — guaranteed immutable
+          container-name: app
+          image: ghcr.io/myorg/myapp@\${{ needs.build.outputs.image-digest }}
+\`\`\``,
+      interviewQuestions: [
+        {
+          question: "Why should you use the image digest rather than the image tag when deploying from CI?",
+          answer: "Image tags are mutable — the same tag (like 'latest' or even 'v1.2.3') can be overwritten to point to a different image. If your deploy job references 'myapp:latest' and another pipeline pushes a new latest between your build and deploy steps, you'll deploy a different image than the one you tested. The image digest (sha256:abc123...) is immutable — it's a cryptographic hash of the image content and can never be reassigned. Using the digest in the deploy step guarantees you deploy exactly the image that was built and tested, not whatever happens to have that tag at deploy time.",
+          difficulty: "mid" as const,
+        },
+      ],
+    },
+    {
+      id: "ci-patterns-monorepo",
+      title: "Real-World CI Patterns: Monorepos, Caching & Concurrency",
+      duration: 45,
+      type: "lesson" as const,
+      description: "Solve real CI problems — path-filtered builds for monorepos, concurrency groups to cancel stale runs, workflow templates, and dependency caching for fast pipelines.",
+      content: `# Real-World CI Patterns
+
+## Path-Filtered Builds for Monorepos
+
+In a monorepo, you don't want every service's CI to run when only one service's code changed. Path filtering scopes workflows to relevant changes:
+
+\`\`\`yaml
+# .github/workflows/service-api.yml
+name: API Service CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'services/api/**'
+      - 'shared/lib/**'       # shared lib changes also trigger API CI
+      - '.github/workflows/service-api.yml'  # workflow file changes trigger it
+  pull_request:
+    branches: [main]
+    paths:
+      - 'services/api/**'
+      - 'shared/lib/**'
+      - '.github/workflows/service-api.yml'
+\`\`\`
+
+**Dynamic matrix from changed services** — Build only services that changed:
+\`\`\`yaml
+jobs:
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      services: \${{ steps.filter.outputs.changes }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            api: ['services/api/**']
+            worker: ['services/worker/**']
+            frontend: ['services/frontend/**']
+
+  build:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.services != '[]'
+    strategy:
+      matrix:
+        service: \${{ fromJSON(needs.detect-changes.outputs.services) }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build \${{ matrix.service }}
+        run: cd services/\${{ matrix.service }} && docker build .
+\`\`\`
+
+## Concurrency Control
+
+Without concurrency limits, pushing 5 commits quickly starts 5 parallel CI runs — wasting runners and potentially deploying an old commit after a newer one:
+
+\`\`\`yaml
+# Cancel in-progress runs for the same branch when a new commit is pushed
+concurrency:
+  group: \${{ github.workflow }}-\${{ github.ref }}
+  cancel-in-progress: true
+\`\`\`
+
+**For production deploys — queue instead of cancel:**
+\`\`\`yaml
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false   # queue; don't cancel an in-progress deploy
+\`\`\`
+
+**Per-PR concurrency** — Cancel the previous CI run for a PR when a new commit is pushed, but never cancel main:
+\`\`\`yaml
+concurrency:
+  group: ci-\${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}
+  cancel-in-progress: \${{ github.ref != 'refs/heads/main' }}
+\`\`\`
+
+## Dependency Caching
+
+The \`actions/cache\` action stores directories between runs. For Node.js, Python, Go, and Gradle:
+
+\`\`\`yaml
+# Node.js — cache node_modules keyed by package-lock.json hash
+- uses: actions/setup-node@v4
+  with:
+    node-version: '20'
+    cache: 'npm'              # built-in: automatically caches ~/.npm
+
+# Python — cache pip packages
+- uses: actions/setup-python@v5
+  with:
+    python-version: '3.12'
+    cache: 'pip'              # caches ~/.cache/pip
+
+# Go — cache module download cache and build cache
+- uses: actions/setup-go@v5
+  with:
+    go-version: '1.22'
+    cache: true               # caches ~/go/pkg/mod and ~/.cache/go-build
+
+# Manual cache for other tools
+- name: Cache Gradle
+  uses: actions/cache@v4
+  with:
+    path: |
+      ~/.gradle/caches
+      ~/.gradle/wrapper
+    key: gradle-\${{ runner.os }}-\${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+    restore-keys: |
+      gradle-\${{ runner.os }}-
+\`\`\`
+
+**Cache key strategy** — Use a primary key + restore-keys fallback:
+- Primary key: exact hash of lock file (perfect cache hit = no install needed)
+- Restore key prefix: partial match returns closest cache (install only delta)
+
+## Workflow Templates (Composite Actions)
+
+Share common steps across workflows as a **composite action** stored in your repo:
+
+\`\`\`yaml
+# .github/actions/setup-node-app/action.yml
+name: 'Setup Node App'
+description: 'Checkout, setup Node, and install dependencies'
+inputs:
+  node-version:
+    description: 'Node.js version'
+    default: '20'
+  working-directory:
+    description: 'Directory containing package.json'
+    default: '.'
+outputs:
+  cache-hit:
+    description: 'Whether npm cache was hit'
+    value: \${{ steps.setup.outputs.cache-hit }}
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/checkout@v4
+
+    - uses: actions/setup-node@v4
+      id: setup
+      with:
+        node-version: \${{ inputs.node-version }}
+        cache: npm
+        cache-dependency-path: \${{ inputs.working-directory }}/package-lock.json
+
+    - name: Install dependencies
+      shell: bash
+      working-directory: \${{ inputs.working-directory }}
+      run: npm ci --prefer-offline
+\`\`\`
+
+Use it:
+\`\`\`yaml
+steps:
+  - uses: ./.github/actions/setup-node-app
+    with:
+      node-version: '20'
+      working-directory: services/api
+\`\`\`
+
+## Environment Variables and Contexts
+
+\`\`\`yaml
+env:
+  # Workflow-level env (all jobs)
+  NODE_ENV: production
+  APP_VERSION: \${{ github.sha }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      # Job-level env (this job only)
+      DEPLOY_ENV: production
+
+    steps:
+      - name: Echo contexts
+        run: |
+          echo "Repo: \${{ github.repository }}"
+          echo "Branch: \${{ github.ref_name }}"
+          echo "SHA: \${{ github.sha }}"
+          echo "Actor: \${{ github.actor }}"
+          echo "Event: \${{ github.event_name }}"
+          echo "Run ID: \${{ github.run_id }}"
+          echo "Run number: \${{ github.run_number }}"
+
+      # Dynamic env from a step output
+      - name: Get version
+        id: version
+        run: echo "tag=\$(git describe --tags --abbrev=0)" >> \$GITHUB_OUTPUT
+
+      - name: Use version
+        run: echo "Deploying \${{ steps.version.outputs.tag }}"
+\`\`\`
+
+## Scheduled Workflows & Manual Triggers
+
+\`\`\`yaml
+on:
+  # Run every day at 2 AM UTC
+  schedule:
+    - cron: '0 2 * * *'
+
+  # Manual trigger with inputs
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        type: choice
+        options: [dev, staging, production]
+        required: true
+      dry-run:
+        description: 'Dry run (plan only, no apply)'
+        type: boolean
+        default: true
+      version:
+        description: 'Version to deploy (leave empty for latest)'
+        type: string
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Show inputs
+        run: |
+          echo "Environment: \${{ inputs.environment }}"
+          echo "Dry run: \${{ inputs.dry-run }}"
+          echo "Version: \${{ inputs.version || 'latest' }}"
+\`\`\`
+
+## Notifications and PR Comments
+
+\`\`\`yaml
+      # Post plan output as PR comment (Terraform, cost estimates, etc.)
+      - name: Comment on PR
+        uses: actions/github-script@v7
+        if: github.event_name == 'pull_request'
+        with:
+          script: |
+            const output = \`## Terraform Plan
+
+            \\\`\\\`\\\`
+            \${{ steps.plan.outputs.stdout }}
+            \\\`\\\`\\\`
+
+            *Triggered by @\${{ github.actor }} on \`\${{ github.ref_name }}\`*\`;
+
+            // Find and update existing comment, or create new one
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existingComment = comments.find(c =>
+              c.user.login === 'github-actions[bot]' &&
+              c.body.includes('## Terraform Plan')
+            );
+
+            if (existingComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existingComment.id,
+                body: output
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: output
+              });
+            }
+
+      # Slack notification on deploy failure
+      - name: Notify Slack on failure
+        if: failure()
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": ":red_circle: Deploy failed on *\${{ github.repository }}*",
+              "blocks": [{
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": ":red_circle: *Deploy failed*\\nRepo: \${{ github.repository }}\\nBranch: \${{ github.ref_name }}\\nActor: \${{ github.actor }}\\n<\${{ github.server_url }}/\${{ github.repository }}/actions/runs/\${{ github.run_id }}|View run>"
+                }
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_URL: \${{ secrets.SLACK_WEBHOOK_URL }}
+\`\`\``,
+      interviewQuestions: [
+        {
+          question: "How do you prevent multiple production deploys from running simultaneously in GitHub Actions?",
+          answer: "Use the 'concurrency' key with 'cancel-in-progress: false'. Setting a shared group name (e.g., 'deploy-production') means only one job in that group runs at a time — additional triggers queue up. 'cancel-in-progress: false' is critical for deploys: you don't want to cancel a running deploy halfway through (that would leave production in an inconsistent state). For PR CI builds, use 'cancel-in-progress: true' — you want the latest commit's tests, not the old one's. Set the group to include the branch ref so PRs don't cancel each other: group: ci-${{ github.ref }}.",
+          difficulty: "mid" as const,
+        },
+      ],
+    },
+  ],
+  exam: [
+    { question: "A Docker image built in CI takes 8 minutes but most of the time is spent on 'npm install'. How do you fix this?", answer: "The npm install layer is being rebuilt on every commit because Docker cache is not persisted between GitHub Actions runner instances. Fix: 1) Enable GitHub Actions cache for BuildKit: add 'cache-from: type=gha' and 'cache-to: type=gha,mode=max' to docker/build-push-action. 2) Optimize the Dockerfile to maximize cache hits: copy only package.json and package-lock.json before running npm install, then copy the rest of the code. This way, the npm install layer is only invalidated when package*.json changes, not on every code change. Expected improvement: from 8 minutes to 30-60 seconds on cache hit.", difficulty: "mid" as const },
+    { question: "You want to build a Docker image only for services that were actually changed in a monorepo PR. How do you implement this?", answer: "Use path filtering with dorny/paths-filter or tj-actions/changed-files to detect which service directories changed. Output the list as a JSON array, then use 'fromJSON()' to feed it into a matrix strategy. The detect-changes job outputs: services: '[\"api\",\"worker\"]' if those directories changed. The build job uses 'strategy.matrix.service: ${{ fromJSON(needs.detect-changes.outputs.services) }}' to run one job per changed service. Add the workflow file itself to all path filters so changing CI config triggers all builds.", difficulty: "senior" as const },
+    { question: "A workflow secret is empty in a deploy job but works in the test job. Both jobs are in the same workflow file. What do you investigate?", answer: "The most common cause: the secret is scoped to a GitHub Environment and the deploy job specifies 'environment: production' while the test job doesn't. Environment secrets are only available to jobs that explicitly declare that environment. Other causes: 1) The secret name has a typo (case-sensitive). 2) The environment requires a reviewer approval before the job starts, and the secret is only available after approval — check if the job is waiting for approval in the Actions UI. 3) The secret was defined at the repo level but the deploy job is using a different environment's secret namespace. Debug: add a step that echoes '${{ secrets.MY_SECRET != \"\" }}' (prints true/false without revealing the value).", difficulty: "mid" as const },
+  ],
+},
+
+{
+  id: "actions-real-world-ci",
+  title: "Full CI/CD Pipeline Patterns",
+  level: "advanced" as const,
+  description: "Complete end-to-end CI/CD pipelines for different stacks — Node.js, Python, Go, and Kubernetes — with environment promotion, OIDC auth, and release automation.",
+  lessons: [
+    {
+      id: "complete-cicd-pipeline",
+      title: "Complete CI/CD Pipeline: Build → Test → Deploy",
+      duration: 50,
+      type: "lesson" as const,
+      description: "Build a complete production pipeline with PR checks, image build, staging deploy, production deploy with manual gate, and automated rollback.",
+      content: `# Complete CI/CD Pipeline: Build → Test → Deploy
+
+## Full Pipeline for a Node.js / Docker Application
+
+This is a production-ready workflow split across three files for separation of concerns:
+
+### File 1: PR Checks (.github/workflows/pr-checks.yml)
+
+\`\`\`yaml
+name: PR Checks
+
+on:
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: pr-\${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_DB: testdb
+          POSTGRES_USER: testuser
+          POSTGRES_PASSWORD: testpass
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Type check
+        run: npm run typecheck
+
+      - name: Unit tests
+        run: npm run test:unit -- --coverage
+
+      - name: Integration tests
+        run: npm run test:integration
+        env:
+          DATABASE_URL: postgresql://testuser:testpass@localhost:5432/testdb
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        with:
+          token: \${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
+
+  security:
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: SAST with CodeQL
+        uses: github/codeql-action/analyze@v3
+        with:
+          languages: javascript
+
+      - name: Dependency audit
+        run: npm audit --audit-level=high
+
+      - name: Secret scanning
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: \${{ github.event.repository.default_branch }}
+          head: HEAD
+\`\`\`
+
+### File 2: Build & Stage (.github/workflows/build-stage.yml)
+
+\`\`\`yaml
+name: Build & Stage
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: build-stage
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ghcr.io/\${{ github.repository }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    outputs:
+      digest: \${{ steps.push.outputs.digest }}
+      version: \${{ steps.version.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0    # needed for git describe
+
+      - name: Get version
+        id: version
+        run: |
+          VERSION=\$(git describe --tags --abbrev=0 2>/dev/null || echo "0.0.0")
+          echo "version=\${VERSION}-\${{ github.run_number }}" >> \$GITHUB_OUTPUT
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: \${{ github.actor }}
+          password: \${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            \${{ env.IMAGE }}:\${{ github.sha }}
+            \${{ env.IMAGE }}:\${{ steps.version.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            VERSION=\${{ steps.version.outputs.version }}
+            BUILD_DATE=\$(date -u +%Y-%m-%dT%H:%M:%SZ)
+            GIT_SHA=\${{ github.sha }}
+
+      - name: Scan image
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: \${{ env.IMAGE }}@\${{ steps.push.outputs.digest }}
+          severity: CRITICAL
+          exit-code: '1'
+          ignore-unfixed: true
+
+      - name: Sign image
+        run: |
+          cosign sign --yes \${{ env.IMAGE }}@\${{ steps.push.outputs.digest }}
+        env:
+          COSIGN_EXPERIMENTAL: 1
+
+  deploy-staging:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+      url: https://staging.myapp.com
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/github-staging-deploy
+          aws-region: us-east-1
+
+      - name: Deploy to staging
+        run: |
+          helm upgrade --install myapp ./charts/myapp \\
+            --namespace staging \\
+            --values charts/myapp/values-staging.yaml \\
+            --set image.repository=\${{ env.IMAGE }} \\
+            --set image.digest=\${{ needs.build.outputs.digest }} \\
+            --set version=\${{ needs.build.outputs.version }} \\
+            --atomic --timeout 5m --wait
+
+      - name: Smoke tests
+        run: |
+          sleep 10  # let load balancer update
+          curl -sf https://staging.myapp.com/health | jq '.status == "ok"'
+
+      - name: E2E tests
+        run: npx playwright test --project=staging
+        env:
+          BASE_URL: https://staging.myapp.com
+\`\`\`
+
+### File 3: Production Deploy (.github/workflows/deploy-prod.yml)
+
+\`\`\`yaml
+name: Deploy Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Image digest to deploy (sha256:...)'
+        required: true
+      confirm:
+        description: 'Type DEPLOY to confirm production deployment'
+        required: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate confirmation
+        if: inputs.confirm != 'DEPLOY'
+        run: |
+          echo "Confirmation text must be 'DEPLOY'"
+          exit 1
+
+      - name: Verify image signature
+        run: |
+          cosign verify \\
+            --certificate-identity-regexp="https://github.com/myorg/myapp" \\
+            --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \\
+            ghcr.io/myorg/myapp@\${{ inputs.version }}
+
+  deploy:
+    needs: validate
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://myapp.com
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS (prod role)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::999888777666:role/github-prod-deploy
+          aws-region: us-east-1
+
+      - name: Deploy to production (canary)
+        run: |
+          helm upgrade --install myapp ./charts/myapp \\
+            --namespace production \\
+            --values charts/myapp/values-prod.yaml \\
+            --set image.digest=\${{ inputs.version }} \\
+            --set rollout.canaryWeight=10 \\
+            --atomic --timeout 10m --wait
+
+      - name: Post-deploy verification
+        run: |
+          ./scripts/post-deploy-verify.sh https://myapp.com
+
+      - name: Annotate Grafana
+        run: |
+          curl -X POST https://grafana.mycompany.com/api/annotations \\
+            -H "Authorization: Bearer \${{ secrets.GRAFANA_API_KEY }}" \\
+            -H "Content-Type: application/json" \\
+            -d '{"text": "Deploy: \${{ inputs.version }} by \${{ github.actor }}", "tags": ["deploy","production"]}'
+\`\`\`
+
+## Release Automation
+
+Automated semantic versioning and GitHub Releases on tag push:
+
+\`\`\`yaml
+name: Release
+
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build release image
+        uses: docker/build-push-action@v5
+        with:
+          push: true
+          tags: |
+            ghcr.io/myorg/myapp:\${{ github.ref_name }}
+            ghcr.io/myorg/myapp:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true   # auto-generate from merged PRs
+          make_latest: true
+          files: |
+            dist/myapp-linux-amd64
+            dist/myapp-darwin-arm64
+            checksums.txt
+\`\`\``,
+      interviewQuestions: [
+        {
+          question: "How do you handle secrets for multiple environments (dev, staging, prod) in GitHub Actions?",
+          answer: "Use GitHub Environments with environment-scoped secrets. Create environments in Settings → Environments: 'staging' and 'production'. Add secrets to each environment (e.g., DATABASE_URL, API_KEY with different values per env). In the workflow, declare 'environment: staging' or 'environment: production' on the job. The job can only access that environment's secrets. Production environments can require manual reviewer approval before the job runs. For cross-account AWS access, use OIDC with different IAM roles per environment — the trust policy can restrict which branch or environment can assume each role.",
+          difficulty: "mid" as const,
+        },
+      ],
+    },
+  ],
+  exam: [
+    { question: "A GitHub Actions workflow runs 'npm test' which passes, but integration tests that run against a PostgreSQL service container fail with 'connection refused'. What do you check?", answer: "Service containers in GitHub Actions are not immediately ready when the job starts — PostgreSQL needs time to initialize. Fix: add health check options to the service container definition: 'options: --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5'. GitHub Actions will wait until the health check passes before running job steps. Also verify: 1) The host is 'localhost' (not 'postgres') when services run on the same runner — service containers are accessible via localhost when using Docker-based runners. 2) The port mapping is correct: 'ports: [\"5432:5432\"]'. 3) The DATABASE_URL env var uses the correct credentials matching the service container's POSTGRES_USER/PASSWORD env vars.", difficulty: "mid" as const },
+    { question: "How do you make a GitHub Actions workflow that only runs expensive E2E tests on PRs from team members, not from external contributors?", answer: "External contributors' PRs run with 'pull_request' trigger which has a read-only GITHUB_TOKEN and no access to secrets. Use 'pull_request_target' for the lightweight checks (runs with write token from the base repo) and gate expensive tests with a condition: 'if: github.event.pull_request.author_association == \"MEMBER\" || github.event.pull_request.author_association == \"COLLABORATOR\"'. For external PRs, run only safe checks (lint, unit tests with no secrets). Add a 'Run E2E' label workflow: when a maintainer applies a specific label to an external PR, trigger the E2E workflow — this gives humans explicit control over when untrusted code gets access to your environments.", difficulty: "senior" as const },
+  ],
+},
   ],
 };

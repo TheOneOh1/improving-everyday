@@ -1356,5 +1356,1182 @@ terraform show -json plan.tfplan | opa eval --data policies/ --input -
         { question: "A Terraform apply fails midway through creating 10 resources. 5 resources were created before the failure. What is the state of the Terraform configuration and what do you do next?", answer: "Terraform writes each resource to state as it is created — it does not roll back. The state now contains the 5 created resources. The other 5 either do not exist or exist partially. Steps: (1) Do NOT re-run apply immediately — first understand why it failed. Check the error message and cloud provider logs. (2) Run 'terraform plan' to see what Terraform intends to do next — it will try to create the remaining 5 resources. Review the plan for correctness. (3) Fix the underlying cause (permissions issue, resource limit, configuration error). (4) Re-run 'terraform apply' — Terraform picks up where it left off, only creating resources not yet in state. Terraform is designed for this — partial applies are recoverable without manual cleanup if the created resources are not conflicting.", difficulty: "mid" },
       ],
     },
+    {
+      id: "terraform-modules",
+      title: "Terraform Modules & Workspaces",
+      level: "intermediate",
+      description: "Build reusable infrastructure components and manage multiple environments.",
+      lessons: [
+        {
+          id: "writing-modules",
+          title: "Writing Reusable Terraform Modules",
+          duration: 30,
+          type: "lesson",
+          description: "Design and build reusable Terraform modules with proper inputs, outputs, and versioning.",
+          objectives: [
+            "Understand Terraform module structure and design principles",
+            "Write modules with variables, outputs, and locals",
+            "Use the Terraform Registry and version constraints",
+            "Test modules with terratest or manual validation",
+          ],
+          content: `# Writing Reusable Terraform Modules
+
+## Why Modules?
+
+Without modules, every team copy-pastes infrastructure code. A bug in the VPC setup gets replicated across 20 repos. Modules solve this:
+
+\`\`\`
+modules/
+  vpc/           ← one VPC implementation, used everywhere
+  eks-cluster/   ← one EKS cluster pattern
+  rds-postgres/  ← one database pattern
+  alb/           ← one load balancer pattern
+
+environments/
+  dev/    → calls modules with dev-sized configs
+  staging/ → same modules, staging-sized configs
+  prod/   → same modules, production-sized configs
+\`\`\`
+
+The same infrastructure pattern is tested once, version-controlled, and promoted.
+
+## Module File Structure
+
+A well-structured module:
+
+\`\`\`
+modules/vpc/
+  main.tf        ← actual resources
+  variables.tf   ← input declarations
+  outputs.tf     ← what callers can reference
+  versions.tf    ← required_providers, terraform version
+  README.md      ← usage examples (auto-generated with terraform-docs)
+\`\`\`
+
+### variables.tf — Inputs
+
+\`\`\`hcl
+variable "vpc_cidr" {
+  description = "CIDR block for the VPC"
+  type        = string
+  default     = "10.0.0.0/16"
+
+  validation {
+    condition     = can(cidrnetmask(var.vpc_cidr))
+    error_message = "vpc_cidr must be a valid CIDR block."
+  }
+}
+
+variable "environment" {
+  description = "Environment name (dev, staging, prod)"
+  type        = string
+
+  validation {
+    condition     = contains(["dev", "staging", "prod"], var.environment)
+    error_message = "environment must be dev, staging, or prod."
+  }
+}
+
+variable "private_subnet_count" {
+  description = "Number of private subnets to create"
+  type        = number
+  default     = 2
+}
+
+variable "enable_nat_gateway" {
+  description = "Whether to create a NAT gateway for private subnets"
+  type        = bool
+  default     = true
+}
+
+variable "tags" {
+  description = "Additional tags to merge with default tags"
+  type        = map(string)
+  default     = {}
+}
+\`\`\`
+
+### main.tf — Resources
+
+\`\`\`hcl
+locals {
+  # Merge caller-provided tags with module defaults
+  common_tags = merge(
+    {
+      Module      = "vpc"
+      Environment = var.environment
+      ManagedBy   = "terraform"
+    },
+    var.tags
+  )
+
+  # Generate subnet CIDRs dynamically
+  private_subnets = [
+    for i in range(var.private_subnet_count) :
+    cidrsubnet(var.vpc_cidr, 8, i + 10)
+  ]
+
+  public_subnets = [
+    for i in range(2) :
+    cidrsubnet(var.vpc_cidr, 8, i)
+  ]
+}
+
+resource "aws_vpc" "this" {
+  cidr_block           = var.vpc_cidr
+  enable_dns_hostnames = true
+  enable_dns_support   = true
+  tags                 = merge(local.common_tags, { Name = "\${var.environment}-vpc" })
+}
+
+resource "aws_subnet" "private" {
+  count             = var.private_subnet_count
+  vpc_id            = aws_vpc.this.id
+  cidr_block        = local.private_subnets[count.index]
+  availability_zone = data.aws_availability_zones.available.names[count.index % length(data.aws_availability_zones.available.names)]
+  tags              = merge(local.common_tags, { Name = "\${var.environment}-private-\${count.index + 1}", Tier = "private" })
+}
+
+resource "aws_nat_gateway" "this" {
+  count         = var.enable_nat_gateway ? 1 : 0
+  allocation_id = aws_eip.nat[0].id
+  subnet_id     = aws_subnet.public[0].id
+  tags          = merge(local.common_tags, { Name = "\${var.environment}-nat" })
+  depends_on    = [aws_internet_gateway.this]
+}
+\`\`\`
+
+### outputs.tf — Expose What Callers Need
+
+\`\`\`hcl
+output "vpc_id" {
+  description = "ID of the created VPC"
+  value       = aws_vpc.this.id
+}
+
+output "private_subnet_ids" {
+  description = "IDs of the private subnets"
+  value       = aws_subnet.private[*].id
+}
+
+output "public_subnet_ids" {
+  description = "IDs of the public subnets"
+  value       = aws_subnet.public[*].id
+}
+
+output "vpc_cidr_block" {
+  description = "CIDR block of the VPC"
+  value       = aws_vpc.this.cidr_block
+}
+\`\`\`
+
+## Calling a Module
+
+\`\`\`hcl
+# environments/prod/main.tf
+
+module "vpc" {
+  source  = "../../modules/vpc"   # local path
+  # OR from registry:
+  # source  = "terraform-aws-modules/vpc/aws"
+  # version = "~> 5.0"
+
+  vpc_cidr             = "10.0.0.0/16"
+  environment          = "prod"
+  private_subnet_count = 3
+  enable_nat_gateway   = true
+
+  tags = {
+    CostCenter = "platform"
+    Owner      = "infra-team"
+  }
+}
+
+# Use module outputs in other resources
+resource "aws_eks_cluster" "main" {
+  name = "prod-eks"
+
+  vpc_config {
+    subnet_ids = module.vpc.private_subnet_ids
+  }
+}
+\`\`\`
+
+## Module Versioning
+
+For modules shared across teams, publish to a registry with version constraints:
+
+\`\`\`hcl
+# Using the public Terraform Registry
+module "vpc" {
+  source  = "terraform-aws-modules/vpc/aws"
+  version = "~> 5.1"   # >= 5.1.0, < 6.0.0 (minor version pinning)
+}
+
+# Private registry (Terraform Cloud / self-hosted)
+module "vpc" {
+  source  = "app.terraform.io/myorg/vpc/aws"
+  version = "= 2.3.1"   # exact pin for production
+}
+
+# Git source with tag (simpler private option)
+module "vpc" {
+  source = "git::https://github.com/myorg/terraform-modules.git//modules/vpc?ref=v1.4.0"
+}
+\`\`\`
+
+**Version constraint best practices:**
+- Production: pin exact version (\`= 2.3.1\`) — no surprise upgrades
+- Development: allow patch updates (\`~> 2.3\`) — get bug fixes
+- Avoid \`>= 2.0\` — too broad, includes breaking changes
+
+## Module Design Principles
+
+**1. Single responsibility**: A VPC module creates only VPC resources, not EKS clusters. Compose modules rather than building monoliths.
+
+**2. Sensible defaults with overrides**: Default to secure/recommended settings; allow callers to override.
+
+**3. No hardcoded values**: Everything that might vary should be a variable. Never hardcode region, account IDs, or environment names.
+
+**4. Expose what callers need**: Output IDs and ARNs of all created resources. Callers should not have to reconstruct what your module made.
+
+**5. Backward compatibility**: Adding new optional variables with defaults is backward-compatible. Removing variables or changing types is a breaking change — bump the major version.
+
+## Testing Modules with Terratest
+
+\`\`\`go
+// test/vpc_test.go
+package test
+
+import (
+  "testing"
+  "github.com/gruntwork-io/terratest/modules/terraform"
+  "github.com/stretchr/testify/assert"
+)
+
+func TestVpcModule(t *testing.T) {
+  opts := &terraform.Options{
+    TerraformDir: "../examples/simple",
+    Vars: map[string]interface{}{
+      "environment": "test",
+      "vpc_cidr":    "10.99.0.0/16",
+    },
+  }
+
+  defer terraform.Destroy(t, opts)  // clean up after test
+  terraform.InitAndApply(t, opts)
+
+  vpcId := terraform.Output(t, opts, "vpc_id")
+  assert.NotEmpty(t, vpcId)
+
+  subnetIds := terraform.OutputList(t, opts, "private_subnet_ids")
+  assert.Equal(t, 2, len(subnetIds))  // default count
+}
+\`\`\`
+
+Run: \`go test -v -timeout 30m ./test/\`
+
+Terratest creates real AWS resources, tests them, and destroys them. Slow but catches real integration issues.`,
+        },
+        {
+          id: "workspaces",
+          title: "Terraform Workspaces & Environment Management",
+          duration: 25,
+          type: "lesson",
+          description: "Use Terraform workspaces and directory-per-environment patterns to manage multiple environments.",
+          objectives: [
+            "Understand Terraform workspace mechanics and limitations",
+            "Compare workspace-per-environment vs directory-per-environment",
+            "Manage environment-specific variables and backend configs",
+            "Implement environment promotion workflows",
+          ],
+          content: `# Terraform Workspaces & Environment Management
+
+## What Are Workspaces?
+
+Terraform workspaces let you maintain multiple state files from the same configuration directory:
+
+\`\`\`bash
+terraform workspace new dev
+terraform workspace new staging
+terraform workspace new prod
+terraform workspace list
+# * dev
+#   staging
+#   prod
+
+terraform workspace select prod
+terraform plan   # uses prod state
+\`\`\`
+
+Each workspace gets its own state file in the backend:
+\`\`\`
+s3://my-tf-state/
+  env:/
+    dev/
+      terraform.tfstate
+    staging/
+      terraform.tfstate
+    prod/
+      terraform.tfstate
+\`\`\`
+
+## Using Workspace in Configuration
+
+\`\`\`hcl
+locals {
+  env = terraform.workspace  # "dev", "staging", "prod"
+
+  config = {
+    dev = {
+      instance_type  = "t3.micro"
+      min_capacity   = 1
+      max_capacity   = 2
+      multi_az       = false
+    }
+    staging = {
+      instance_type  = "t3.small"
+      min_capacity   = 2
+      max_capacity   = 4
+      multi_az       = false
+    }
+    prod = {
+      instance_type  = "t3.medium"
+      min_capacity   = 3
+      max_capacity   = 10
+      multi_az       = true
+    }
+  }
+}
+
+resource "aws_db_instance" "main" {
+  instance_class    = local.config[local.env].instance_type
+  multi_az          = local.config[local.env].multi_az
+  identifier        = "\${local.env}-postgres"
+}
+\`\`\`
+
+## Workspace Limitations
+
+Workspaces share the same configuration code. This causes problems:
+
+- Can't use different providers per environment (different AWS accounts)
+- Hard to review — prod and dev configs are interleaved
+- One typo in the workspace config affects all environments
+- State lock for one workspace blocks all workspaces in some backends
+
+**Workspaces work well for**: temporary feature environments, quick multi-region deployments with identical config, developer sandboxes.
+
+**Workspaces are wrong for**: dev/staging/prod with different AWS accounts, significantly different architectures per environment.
+
+## Directory-Per-Environment (Recommended for Production)
+
+\`\`\`
+infra/
+  modules/
+    vpc/
+    eks/
+    rds/
+  environments/
+    dev/
+      main.tf        ← calls modules with dev config
+      variables.tf
+      backend.tf     ← dev S3 bucket, dev DynamoDB table
+      terraform.tfvars
+    staging/
+      main.tf
+      backend.tf     ← staging S3 bucket
+      terraform.tfvars
+    prod/
+      main.tf
+      backend.tf     ← prod S3 bucket, separate AWS account
+      terraform.tfvars
+\`\`\`
+
+Each environment is independently planned and applied — production changes never touch development state.
+
+### Environment-Specific Backends
+
+\`\`\`hcl
+# environments/prod/backend.tf
+terraform {
+  backend "s3" {
+    bucket         = "mycompany-tf-state-prod"
+    key            = "eks/terraform.tfstate"
+    region         = "us-east-1"
+    dynamodb_table = "tf-locks-prod"
+    encrypt        = true
+    # Assume a role in the prod account
+    role_arn       = "arn:aws:iam::PROD_ACCOUNT_ID:role/TerraformStateRole"
+  }
+}
+\`\`\`
+
+\`\`\`hcl
+# environments/dev/backend.tf
+terraform {
+  backend "s3" {
+    bucket         = "mycompany-tf-state-dev"
+    key            = "eks/terraform.tfstate"
+    region         = "us-east-1"
+    dynamodb_table = "tf-locks-dev"
+    encrypt        = true
+    role_arn       = "arn:aws:iam::DEV_ACCOUNT_ID:role/TerraformStateRole"
+  }
+}
+\`\`\`
+
+### terraform.tfvars Per Environment
+
+\`\`\`hcl
+# environments/dev/terraform.tfvars
+environment          = "dev"
+vpc_cidr             = "10.0.0.0/16"
+eks_node_instance    = "t3.medium"
+eks_min_nodes        = 2
+eks_max_nodes        = 5
+rds_instance_class   = "db.t3.medium"
+rds_multi_az         = false
+enable_waf           = false
+\`\`\`
+
+\`\`\`hcl
+# environments/prod/terraform.tfvars
+environment          = "prod"
+vpc_cidr             = "10.10.0.0/16"
+eks_node_instance    = "m5.xlarge"
+eks_min_nodes        = 5
+eks_max_nodes        = 50
+rds_instance_class   = "db.r6g.xlarge"
+rds_multi_az         = true
+enable_waf           = true
+\`\`\`
+
+## Environment Promotion Workflow
+
+The promotion process ensures what runs in staging is exactly what runs in production:
+
+\`\`\`
+1. Engineer develops in dev:
+   cd environments/dev && terraform plan && terraform apply
+
+2. PR raised — infrastructure code reviewed like application code
+
+3. Merge to main triggers CI:
+   - terraform plan for staging (posted as PR comment)
+   - Human reviews plan
+   - terraform apply to staging
+   - Integration tests run against staging
+
+4. Staging validated → promotion PR to prod:
+   - Update prod/terraform.tfvars with new module version or config
+   - terraform plan for prod reviewed by senior engineer + security
+   - Manual approval gate (GitHub Environment protection rule)
+   - terraform apply to prod
+   - Canary monitoring for 30 minutes
+\`\`\`
+
+**Key rule**: Production applies must use the exact same module versions that passed staging. Pin module versions:
+
+\`\`\`hcl
+# staging/main.tf
+module "eks" {
+  source  = "../../modules/eks"
+  version = "= 3.2.1"   # tested this version in staging
+}
+
+# prod/main.tf — same pin after staging passes
+module "eks" {
+  source  = "../../modules/eks"
+  version = "= 3.2.1"   # promoted from staging
+}
+\`\`\`
+
+## Passing Outputs Between Environments
+
+When environments share infrastructure (e.g., prod EKS uses prod VPC):
+
+\`\`\`hcl
+# environments/prod/main.tf
+data "terraform_remote_state" "vpc" {
+  backend = "s3"
+  config = {
+    bucket = "mycompany-tf-state-prod"
+    key    = "vpc/terraform.tfstate"
+    region = "us-east-1"
+  }
+}
+
+module "eks" {
+  source             = "../../modules/eks"
+  vpc_id             = data.terraform_remote_state.vpc.outputs.vpc_id
+  private_subnet_ids = data.terraform_remote_state.vpc.outputs.private_subnet_ids
+}
+\`\`\`
+
+This is better than hardcoding VPC IDs — any VPC change propagates automatically on next apply.`,
+        },
+      ],
+      exam: [
+        { question: "You have three teams sharing a single Terraform repository. Each team owns different AWS resources and needs to apply changes independently. How do you structure the repository?", answer: "Use a directory-per-team-per-environment layout: infra/teams/platform/environments/prod, infra/teams/data/environments/prod, infra/teams/app/environments/prod. Each directory has its own backend config pointing to a separate state file. Teams can plan and apply independently without state lock conflicts. Shared infrastructure (VPC, IAM base) goes in a shared/ root with remote_state outputs that other teams read. Use strict IAM: the data team's CI role can only access the data team's state bucket, preventing cross-team accidents.", difficulty: "senior" },
+        { question: "A module you published at version 1.0.0 has a bug. You fix it in 1.0.1. Callers pinned to '~> 1.0' get the fix automatically, but callers pinned to '= 1.0.0' do not. How do you communicate this and what's the guidance?", answer: "For security or data-loss bugs: file a GitHub advisory, add a note to the module README that 1.0.0 has a known bug and 1.0.1 is required, reach out directly to known consumers. For non-critical bugs: standard release notes and changelog. Guidance: production callers should pin exact versions (= 1.0.0) for stability, but they must have a process to periodically review and bump module versions — a scheduled job that opens PRs with module version bumps works well. The advantage of exact pinning is that upgrades are explicit and reviewed; the cost is that security fixes require manual action.", difficulty: "senior" },
+        { question: "When should you use Terraform workspaces vs separate directories for environments?", answer: "Workspaces: use for identical infrastructure in multiple regions, temporary developer sandboxes, or feature environments that mirror a base config exactly. They're convenient when the config is truly identical and all environments live in the same AWS account. Separate directories: use when environments differ in size, architecture, or AWS account. Production should almost always be in a separate directory — it may use different AWS accounts (separate state backends with role_arn), different instance types, different feature flags, and must be independently deployable without touching dev state. The rule: if you'd feel uncomfortable with the same 'terraform apply' touching both dev and prod, use separate directories.", difficulty: "mid" },
+        { question: "How do you handle secrets (database passwords, API keys) in Terraform without storing them in state plaintext?", answer: "Several approaches: (1) AWS Secrets Manager or Parameter Store: use a data source to reference the secret by name — Terraform reads the value at plan time but only stores the reference in state, not the value. Sensitive variables still appear in state for resources that accept them directly. (2) Mark variables as sensitive: 'variable \"db_password\" { sensitive = true }' — Terraform redacts the value from plan output and logs. (3) Don't create secrets in Terraform: create the secret resource without a value, then set the value via AWS CLI or a separate secrets management tool (Vault, External Secrets Operator). (4) Encrypt state: always use S3 with SSE-KMS for state backend — even if a password leaks into state, it's encrypted at rest and access is logged.", difficulty: "mid" },
+      ],
+    },
+    {
+      id: "advanced-hcl",
+      title: "Advanced HCL Patterns",
+      level: "intermediate",
+      description: "Master for_each, dynamic blocks, locals, data sources, and lifecycle meta-arguments.",
+      lessons: [
+        {
+          id: "for-each-and-count",
+          title: "for_each, count, and Dynamic Blocks",
+          duration: 30,
+          type: "lesson",
+          description: "Write DRY Terraform with iteration, conditional resources, and dynamic configuration blocks.",
+          objectives: [
+            "Use for_each with maps and sets for stable resource management",
+            "Understand when count is appropriate vs for_each",
+            "Write dynamic blocks for variable-length configuration",
+            "Use for expressions to transform data structures",
+          ],
+          content: `# for_each, count, and Dynamic Blocks
+
+## count vs for_each
+
+**count** creates N copies of a resource, indexed by integer:
+
+\`\`\`hcl
+resource "aws_instance" "web" {
+  count         = 3
+  instance_type = "t3.micro"
+  ami           = data.aws_ami.ubuntu.id
+  tags = { Name = "web-\${count.index}" }
+}
+
+# Reference: aws_instance.web[0], aws_instance.web[1], aws_instance.web[2]
+\`\`\`
+
+**Problem with count**: If you remove the middle item from a list, Terraform renumbers all subsequent instances — it destroys and recreates them:
+
+\`\`\`hcl
+# Was: ["web1", "web2", "web3"]
+# Remove "web2": ["web1", "web3"]
+# Terraform sees: index 1 changed from "web2" to "web3" → destroy+create
+# This is dangerous for stateful resources
+\`\`\`
+
+**for_each** uses a map or set — each resource has a stable key:
+
+\`\`\`hcl
+resource "aws_instance" "web" {
+  for_each      = toset(["web1", "web2", "web3"])
+  instance_type = "t3.micro"
+  ami           = data.aws_ami.ubuntu.id
+  tags          = { Name = each.key }
+}
+
+# Reference: aws_instance.web["web1"], aws_instance.web["web2"]
+# Removing "web2" only destroys aws_instance.web["web2"] — others untouched
+\`\`\`
+
+**for_each with a map** — pass rich configuration per resource:
+
+\`\`\`hcl
+locals {
+  buckets = {
+    assets = {
+      acl         = "public-read"
+      versioning  = false
+      lifecycle_days = 90
+    }
+    backups = {
+      acl         = "private"
+      versioning  = true
+      lifecycle_days = 365
+    }
+    logs = {
+      acl         = "private"
+      versioning  = false
+      lifecycle_days = 30
+    }
+  }
+}
+
+resource "aws_s3_bucket" "this" {
+  for_each = local.buckets
+  bucket   = "\${var.environment}-\${each.key}"
+  tags     = { Name = each.key, Environment = var.environment }
+}
+
+resource "aws_s3_bucket_versioning" "this" {
+  for_each = { for k, v in local.buckets : k => v if v.versioning }
+  bucket   = aws_s3_bucket.this[each.key].id
+
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+\`\`\`
+
+## for Expressions
+
+Transform one data structure into another:
+
+\`\`\`hcl
+# List to set of uppercase strings
+variable "environments" {
+  default = ["dev", "staging", "prod"]
+}
+
+locals {
+  env_upper = [for e in var.environments : upper(e)]
+  # → ["DEV", "STAGING", "PROD"]
+
+  # List to map
+  env_map = { for e in var.environments : e => "\${e}.example.com" }
+  # → { dev = "dev.example.com", staging = "staging.example.com", ... }
+
+  # Filter with if
+  prod_only = [for e in var.environments : e if e != "dev"]
+  # → ["staging", "prod"]
+
+  # Map to list of values
+  subnet_ids = [for k, v in aws_subnet.this : v.id]
+}
+\`\`\`
+
+**Invert a map** (swap keys and values):
+
+\`\`\`hcl
+variable "role_arns" {
+  default = {
+    admin   = "arn:aws:iam::123:role/admin"
+    readonly = "arn:aws:iam::123:role/readonly"
+  }
+}
+
+locals {
+  arn_to_role = { for name, arn in var.role_arns : arn => name }
+  # → { "arn:aws:iam::123:role/admin" = "admin", ... }
+}
+\`\`\`
+
+## dynamic Blocks
+
+Use \`dynamic\` when a resource has a variable number of nested blocks:
+
+\`\`\`hcl
+variable "ingress_rules" {
+  default = [
+    { port = 80,  cidr = "0.0.0.0/0",      description = "HTTP" },
+    { port = 443, cidr = "0.0.0.0/0",      description = "HTTPS" },
+    { port = 22,  cidr = "10.0.0.0/8",     description = "SSH internal" },
+  ]
+}
+
+resource "aws_security_group" "web" {
+  name   = "web-sg"
+  vpc_id = var.vpc_id
+
+  dynamic "ingress" {
+    for_each = var.ingress_rules
+    content {
+      from_port   = ingress.value.port
+      to_port     = ingress.value.port
+      protocol    = "tcp"
+      cidr_blocks = [ingress.value.cidr]
+      description = ingress.value.description
+    }
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+\`\`\`
+
+**Dynamic blocks for optional nested blocks**:
+
+\`\`\`hcl
+variable "enable_encryption" {
+  default = true
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "this" {
+  bucket = aws_s3_bucket.this.id
+
+  dynamic "rule" {
+    for_each = var.enable_encryption ? [1] : []  # trick: 1-element list = enabled
+    content {
+      apply_server_side_encryption_by_default {
+        sse_algorithm = "AES256"
+      }
+    }
+  }
+}
+\`\`\`
+
+## locals — Simplify Complex Expressions
+
+\`\`\`hcl
+locals {
+  # Compute once, use many times
+  account_id = data.aws_caller_identity.current.account_id
+  region     = data.aws_region.current.name
+
+  # Conditional value
+  log_retention = var.environment == "prod" ? 365 : 30
+
+  # Build complex structures from inputs
+  eks_tags = merge(
+    var.common_tags,
+    {
+      "kubernetes.io/cluster/\${var.cluster_name}" = "owned"
+    }
+  )
+
+  # Flatten nested structure
+  all_subnet_ids = flatten([
+    aws_subnet.private[*].id,
+    aws_subnet.public[*].id,
+  ])
+
+  # Conditional resource set
+  multi_az_subnets = var.multi_az ? var.availability_zones : [var.availability_zones[0]]
+}
+\`\`\`
+
+## Data Sources
+
+Data sources read existing infrastructure without managing it:
+
+\`\`\`hcl
+# Look up the latest Ubuntu AMI
+data "aws_ami" "ubuntu" {
+  most_recent = true
+  owners      = ["099720109477"]  # Canonical's AWS account
+
+  filter {
+    name   = "name"
+    values = ["ubuntu/images/hvm-ssd/ubuntu-*-22.04-amd64-server-*"]
+  }
+
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+}
+
+# Look up existing VPC by tag
+data "aws_vpc" "main" {
+  tags = {
+    Environment = var.environment
+    ManagedBy   = "terraform"
+  }
+}
+
+# Look up all subnets in a VPC
+data "aws_subnets" "private" {
+  filter {
+    name   = "vpc-id"
+    values = [data.aws_vpc.main.id]
+  }
+  tags = {
+    Tier = "private"
+  }
+}
+
+# Current AWS account and region
+data "aws_caller_identity" "current" {}
+data "aws_region" "current" {}
+
+# IAM policy document (safer than raw JSON strings)
+data "aws_iam_policy_document" "s3_read" {
+  statement {
+    effect    = "Allow"
+    actions   = ["s3:GetObject", "s3:ListBucket"]
+    resources = [
+      aws_s3_bucket.assets.arn,
+      "\${aws_s3_bucket.assets.arn}/*",
+    ]
+  }
+}
+
+resource "aws_iam_policy" "s3_read" {
+  name   = "s3-read-policy"
+  policy = data.aws_iam_policy_document.s3_read.json
+}
+\`\`\`
+
+## lifecycle Meta-Arguments
+
+Control how Terraform handles resource changes:
+
+\`\`\`hcl
+resource "aws_instance" "app" {
+  ami           = data.aws_ami.ubuntu.id
+  instance_type = var.instance_type
+
+  lifecycle {
+    # Create new instance before destroying old one
+    # Prevents downtime during AMI updates
+    create_before_destroy = true
+
+    # Prevent Terraform from destroying this resource
+    # Useful for production databases
+    prevent_destroy = true
+
+    # Ignore changes to these attributes after creation
+    # Prevents Terraform from fighting with auto-scaling
+    ignore_changes = [
+      ami,           # don't rebuild when AMI updates
+      user_data,     # launched instances may have drifted user_data
+    ]
+
+    # Custom pre-condition: validate before applying
+    precondition {
+      condition     = var.instance_type != "t2.micro"
+      error_message = "t2.micro is too small for production. Use t3.small or larger."
+    }
+
+    # Custom post-condition: validate after apply
+    postcondition {
+      condition     = self.public_ip != ""
+      error_message = "Instance did not get a public IP as expected."
+    }
+  }
+}
+\`\`\`
+
+## moved Block — Rename Resources Without Destroy
+
+When you need to rename a resource or move it into a module:
+
+\`\`\`hcl
+# Old: aws_instance.web
+# New: module.web_servers.aws_instance.web
+
+moved {
+  from = aws_instance.web
+  to   = module.web_servers.aws_instance.web
+}
+\`\`\`
+
+Terraform updates the state entry without destroying and recreating the resource. Once applied, remove the \`moved\` block.
+
+**When to use**: Refactoring modules, renaming resources, moving from count to for_each:
+
+\`\`\`hcl
+# Moving from count to for_each (common refactor)
+moved {
+  from = aws_subnet.private[0]
+  to   = aws_subnet.private["us-east-1a"]
+}
+moved {
+  from = aws_subnet.private[1]
+  to   = aws_subnet.private["us-east-1b"]
+}
+\`\`\``,
+        },
+        {
+          id: "terraform-functions-patterns",
+          title: "Terraform Functions & Real-World Patterns",
+          duration: 25,
+          type: "lesson",
+          description: "Use Terraform's built-in functions and apply patterns for real production infrastructure.",
+          objectives: [
+            "Use string, collection, and encoding functions effectively",
+            "Apply templatefile and jsonencode for configuration generation",
+            "Implement common production patterns: tagging strategy, multi-region, conditional modules",
+            "Debug Terraform with console and targeted applies",
+          ],
+          content: `# Terraform Functions & Real-World Patterns
+
+## Essential Built-in Functions
+
+### String Functions
+
+\`\`\`hcl
+locals {
+  # format — construct strings
+  bucket_name = format("%s-%s-%s", var.company, var.environment, var.region)
+  # → "myco-prod-us-east-1"
+
+  # replace — sanitize inputs
+  safe_name = replace(var.name, "/[^a-z0-9-]/", "-")
+
+  # split and join
+  parts  = split(",", "a,b,c")  # → ["a", "b", "c"]
+  joined = join("-", ["web", "app", "01"])  # → "web-app-01"
+
+  # trim and strip
+  clean = trimspace("  hello  ")  # → "hello"
+  stripped = trimprefix("prod-eks", "prod-")  # → "eks"
+
+  # substr
+  short_id = substr(var.long_id, 0, 8)  # first 8 characters
+}
+\`\`\`
+
+### Collection Functions
+
+\`\`\`hcl
+locals {
+  # concat — combine lists
+  all_subnets = concat(var.private_subnets, var.public_subnets)
+
+  # flatten — remove nesting
+  flat_ids = flatten([["a", "b"], ["c", "d"]])  # → ["a", "b", "c", "d"]
+
+  # distinct — remove duplicates
+  unique_azs = distinct(["us-east-1a", "us-east-1a", "us-east-1b"])
+
+  # merge — combine maps (later maps win on collision)
+  tags = merge(var.default_tags, var.resource_tags, { ManagedBy = "terraform" })
+
+  # contains — check membership
+  is_prod = contains(["prod", "production"], var.environment)
+
+  # lookup — safe map access with default
+  instance_type = lookup(local.instance_types, var.environment, "t3.micro")
+
+  # keys and values
+  env_names = keys(var.environments)
+  env_cidrs = values(var.environment_cidrs)
+
+  # zipmap — build map from two lists
+  env_map = zipmap(
+    ["dev", "staging", "prod"],
+    ["10.0.0.0/16", "10.1.0.0/16", "10.2.0.0/16"]
+  )
+}
+\`\`\`
+
+### Encoding Functions
+
+\`\`\`hcl
+# jsonencode — convert HCL to JSON string
+resource "aws_iam_role_policy" "inline" {
+  role = aws_iam_role.lambda.name
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["s3:GetObject"]
+        Resource = "\${aws_s3_bucket.data.arn}/*"
+      }
+    ]
+  })
+}
+
+# yamlencode — HCL to YAML string
+locals {
+  k8s_config = yamlencode({
+    apiVersion = "v1"
+    kind       = "ConfigMap"
+    metadata = { name = "app-config" }
+    data = {
+      DB_HOST = aws_db_instance.main.address
+      DB_PORT = tostring(aws_db_instance.main.port)
+    }
+  })
+}
+
+# base64encode — for binary/sensitive data
+resource "aws_instance" "app" {
+  user_data = base64encode(templatefile("scripts/init.sh.tpl", {
+    db_host = aws_db_instance.main.address
+  }))
+}
+\`\`\`
+
+### templatefile Function
+
+Generate configuration files from templates:
+
+\`\`\`hcl
+# scripts/init.sh.tpl
+#!/bin/bash
+apt-get update
+apt-get install -y nginx
+
+cat > /etc/nginx/conf.d/app.conf <<EOF
+upstream backend {
+%{ for addr in backend_addresses ~}
+  server \${addr}:8080;
+%{ endfor ~}
+}
+server {
+  listen 80;
+  location / {
+    proxy_pass http://backend;
+  }
+}
+EOF
+
+systemctl restart nginx
+echo "DB_HOST=\${db_host}" >> /etc/environment
+echo "ENVIRONMENT=\${environment}" >> /etc/environment
+
+# terraform code
+resource "aws_instance" "nginx" {
+  user_data = base64encode(templatefile("\${path.module}/scripts/init.sh.tpl", {
+    backend_addresses = aws_instance.app[*].private_ip
+    db_host           = aws_db_instance.main.address
+    environment       = var.environment
+  }))
+}
+\`\`\`
+
+## Production Tagging Strategy
+
+Consistent tagging is critical for cost allocation and automation:
+
+\`\`\`hcl
+# modules/tagging/main.tf
+locals {
+  # Mandatory tags — all resources must have these
+  required_tags = {
+    Environment    = var.environment           # prod, staging, dev
+    Application    = var.application           # "payment-service"
+    Team           = var.team                  # "platform"
+    CostCenter     = var.cost_center           # "engineering-platform"
+    ManagedBy      = "terraform"
+    TerraformRepo  = var.repo_url              # "github.com/myorg/infra"
+    DataClass      = var.data_classification   # "public", "internal", "confidential"
+  }
+
+  # Merge with optional extra tags
+  all_tags = merge(local.required_tags, var.additional_tags)
+}
+
+output "tags" {
+  value = local.all_tags
+}
+
+# In every resource across all modules
+resource "aws_s3_bucket" "this" {
+  bucket = var.bucket_name
+  tags   = module.tagging.tags  # or: merge(module.tagging.tags, { specific = "value" })
+}
+\`\`\`
+
+**AWS default tags on the provider** — tag every resource automatically:
+
+\`\`\`hcl
+provider "aws" {
+  region = "us-east-1"
+
+  default_tags {
+    tags = {
+      ManagedBy   = "terraform"
+      TerraformRepo = "github.com/myorg/infra"
+      Environment = var.environment
+    }
+  }
+}
+\`\`\`
+
+## Conditional Module Instantiation
+
+\`\`\`hcl
+# Only create WAF in production
+module "waf" {
+  count  = var.environment == "prod" ? 1 : 0
+  source = "../../modules/waf"
+  alb_arn = aws_lb.main.arn
+}
+
+# Only create read replica in prod/staging
+module "db_replica" {
+  count              = contains(["prod", "staging"], var.environment) ? 1 : 0
+  source             = "../../modules/rds-replica"
+  primary_identifier = aws_db_instance.main.identifier
+}
+
+# Enable monitoring only in prod
+resource "aws_cloudwatch_metric_alarm" "cpu_high" {
+  count               = var.environment == "prod" ? 1 : 0
+  alarm_name          = "cpu-high-\${var.environment}"
+  comparison_operator = "GreaterThanThreshold"
+  threshold           = 80
+  # ...
+}
+\`\`\`
+
+## Debugging Terraform
+
+**terraform console** — interactive expression evaluation:
+
+\`\`\`bash
+$ terraform console
+
+# Test expressions before putting them in code
+> cidrsubnet("10.0.0.0/16", 8, 3)
+"10.0.3.0/24"
+
+> formatdate("YYYY-MM-DD", timestamp())
+"2024-01-15"
+
+> length(var.availability_zones)
+3
+
+> { for k, v in var.tags : k => upper(v) }
+{ "env" = "PROD", "team" = "PLATFORM" }
+
+# Exit with Ctrl+D
+\`\`\`
+
+**Targeted apply** — apply only specific resources during debugging:
+
+\`\`\`bash
+# Apply only one resource (useful when fixing a broken resource)
+terraform apply -target=aws_instance.web["web1"]
+
+# Apply only a module
+terraform apply -target=module.vpc
+
+# Plan a specific resource
+terraform plan -target=aws_security_group.web
+\`\`\`
+
+**Caution**: Targeted applies can leave state inconsistent. Use only for debugging; always follow with a full plan to verify state is correct.
+
+**terraform state commands** — inspect and repair state:
+
+\`\`\`bash
+# List all resources in state
+terraform state list
+
+# Show a specific resource's state
+terraform state show aws_instance.web["web1"]
+
+# Remove a resource from state (without destroying it)
+# Use when a resource was deleted manually and you want Terraform to forget it
+terraform state rm aws_instance.abandoned
+
+# Import existing resource into state
+# Use when a resource was created manually and you want Terraform to manage it
+terraform import aws_instance.web i-0abcd1234567890
+
+# Move resource in state (same as moved block but CLI-only)
+terraform state mv aws_instance.old aws_instance.new
+\`\`\``,
+        },
+      ],
+      exam: [
+        { question: "You have 20 S3 buckets defined with 'count'. You need to remove the bucket at index 5. What happens and how do you prevent it?", answer: "With count, removing index 5 causes Terraform to renumber all subsequent resources: index 6 becomes 5, 7 becomes 6, etc. Terraform destroys and recreates every resource from index 5 onward — potentially 15 bucket deletions and recreations, which destroys data. Prevention: migrate from count to for_each with a set of bucket names. Each bucket gets a stable string key instead of an integer index. Removing one key only affects that specific bucket. Migration requires 'moved' blocks to rename state entries without destroying: 'moved { from = aws_s3_bucket.this[5] to = aws_s3_bucket.this[\"logs\"] }'", difficulty: "senior" },
+        { question: "Write a for expression that takes a map of {service_name: port_number} and produces a list of security group ingress rule objects with from_port and to_port set to the port.", answer: "local { ingress_rules = [ for name, port in var.services : { description = name, from_port = port, to_port = port, protocol = \"tcp\", cidr_blocks = [\"10.0.0.0/8\"] } ] }. Then use a dynamic ingress block that iterates over local.ingress_rules. The for expression transforms the map into a list of objects that the dynamic block can consume.", difficulty: "mid" },
+        { question: "A Terraform plan shows a resource being destroyed and recreated due to a name change. The resource is a production database. How do you rename it without causing downtime?", answer: "Use a 'moved' block: 'moved { from = aws_db_instance.old_name to = aws_db_instance.new_name }'. Add this block to your configuration and run terraform plan — it should show zero destroy/create operations, only a state rename. Apply the plan. The physical database is not modified; only the state file is updated. After the apply succeeds, remove the moved block in a follow-up commit. If the resource is inside a module, the moved block can reference module addresses: 'from = module.old.aws_db_instance.main to = module.new.aws_db_instance.main'.", difficulty: "senior" },
+        { question: "What is the difference between 'lifecycle { ignore_changes = [ami] }' and importing the resource with 'terraform import'? When would you use each?", answer: "ignore_changes tells Terraform to never update a specific attribute after initial creation — even if the HCL value changes, Terraform won't plan a change to that attribute. Use it for attributes managed by external systems (ASG replaces AMI, Kubernetes modifies annotations). terraform import pulls an existing real-world resource into Terraform state so Terraform can manage it going forward — it reads the current resource state and records it. Use import when you created a resource manually or outside Terraform and want to bring it under Terraform management. They solve different problems: ignore_changes suppresses unwanted updates; import adopts unmanaged resources.", difficulty: "mid" },
+      ],
+    },
   ],
 };

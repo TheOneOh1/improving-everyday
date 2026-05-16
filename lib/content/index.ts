@@ -16,6 +16,7 @@ import { webTechnologyTrack } from "./web-technology";
 import { complianceTrack } from "./compliance";
 import { databasesTrack } from "./databases";
 import { sdlcTrack } from "./sdlc";
+import { golangTrack } from "./golang";
 import type { Track, LessonWithContext, Module, Lesson } from "./types";
 
 export * from "./types";
@@ -33,13 +34,14 @@ export const tracks: Track[] = [
   databasesTrack,         // 09 Databases
   webTechnologyTrack,     // 10 Web layer
   sdlcTrack,              // 11 SDLC
-  terraformTrack,         // 12 IaC
-  awsTrack,               // 13 Cloud
-  kubernetesTrack,        // 14 Orchestration
-  devsecopsTrack,         // 15 Advanced security/ops
-  troubleshootingTrack,   // 16 Advanced debugging
-  complianceTrack,        // 17 Governance
-  promptEngineeringTrack, // 18 AI
+  golangTrack,            // 12 Go programming
+  terraformTrack,         // 13 IaC
+  awsTrack,               // 14 Cloud
+  kubernetesTrack,        // 15 Orchestration
+  devsecopsTrack,         // 16 Advanced security/ops
+  troubleshootingTrack,   // 17 Advanced debugging
+  complianceTrack,        // 18 Governance
+  promptEngineeringTrack, // 19 AI
 ];
 
 export function getTrack(trackId: string): Track | undefined {
