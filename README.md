@@ -7,14 +7,14 @@ A modern, self-paced learning platform for DevOps engineers. 20 structured track
 ## Features
 
 - **20 learning tracks** organized from beginner to advanced, with modules and individual lessons
-- **Progress tracking** — lesson completion state persisted in localStorage per profile
-- **Profile system** — create multiple learner profiles; progress is tracked per profile
-- **Module exams** — quiz-style assessments at the end of each module to test knowledge
+- **Progress tracking** — lesson completion state saved automatically per profile
+- **Profile system** — create multiple learner profiles, each with their own progress
+- **Module exams** — quiz-style assessments at the end of each module
 - **Notes** — attach personal notes to any lesson
 - **Full-text search** — search across all 20 tracks, modules, and lessons instantly
+- **Light / Dark mode** — toggle between themes from the top nav bar
 - **Lesson navigation** — prev/next lesson links within a track, breadcrumb navigation
-- **Responsive sidebar** — quick access to all tracks and lessons from anywhere in the app
-- **Dark UI** — terminal-inspired design built for engineers
+- **No backend required** — all data is stored in your browser (localStorage)
 
 ---
 
@@ -58,50 +58,178 @@ A modern, self-paced learning platform for DevOps engineers. 20 structured track
 
 ---
 
-## Tech Stack
+## Running Locally
 
-- **[Next.js](https://nextjs.org)** (App Router) — framework
-- **TypeScript** — type-safe throughout
-- **Tailwind CSS** — styling
-- **localStorage** — all state (profiles, progress, notes) persisted client-side with no backend
-- **React Context** — profile and progress state management
-- **Lucide React** — icons
+### What you need first
 
----
+Before you start, make sure you have the following installed on your computer:
 
-## Getting Started
+- **Node.js v18 or higher** — download from [nodejs.org](https://nodejs.org). Choose the "LTS" version if you're unsure.
+  - To check if you already have it: open a terminal and run `node -v`
+- **Git** — download from [git-scm.com](https://git-scm.com)
+  - To check if you already have it: run `git --version`
+
+### Step-by-step setup
+
+**1. Clone the repository**
+
+This downloads the project code to your computer.
 
 ```bash
-# Clone the repo
-git clone <repo-url>
+git clone https://github.com/<your-username>/devops-lms.git
+```
+
+**2. Enter the project folder**
+
+```bash
 cd devops-lms
+```
 
-# Install dependencies
+**3. Install dependencies**
+
+This installs all the libraries the project needs. It may take a minute.
+
+```bash
 npm install
+```
 
-# Start the dev server
+**4. Start the development server**
+
+```bash
 npm run dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) in your browser. You'll be prompted to create a learner profile on first launch.
+**5. Open the app**
+
+Open your browser and go to: [http://localhost:3000](http://localhost:3000)
+
+You'll be asked to create a learner profile on first launch. Enter any name and click **Get Started**.
+
+> **Tip:** The development server has hot reload — any changes you make to the code will appear in the browser instantly without needing to restart.
+
+---
+
+## Running with Docker
+
+Docker lets you run the app in a container without installing Node.js. This is the recommended way to run it in production.
+
+### What you need
+
+- **Docker Desktop** — download from [docker.com](https://www.docker.com/products/docker-desktop). Install it and make sure it's running (you'll see the Docker icon in your taskbar/menu bar).
+
+### Option 1 — Pull the pre-built image from GitHub Container Registry
+
+If the project has been pushed to GitHub, you can pull the ready-made image directly:
+
+```bash
+docker pull ghcr.io/<github-username>/<repo-name>:latest
+docker run -p 3000:3000 ghcr.io/<github-username>/<repo-name>:latest
+```
+
+Then open [http://localhost:3000](http://localhost:3000).
+
+### Option 2 — Build the image yourself
+
+If you've cloned the repository and want to build locally:
+
+```bash
+# Build the image (this takes a few minutes the first time)
+docker build -t devops-lms .
+
+# Run the container
+docker run -p 3000:3000 devops-lms
+```
+
+Then open [http://localhost:3000](http://localhost:3000).
+
+To stop the container, press `Ctrl + C` in the terminal.
+
+### Run in the background (detached mode)
+
+If you want the container to keep running after you close the terminal:
+
+```bash
+docker run -d -p 3000:3000 --name devops-lms devops-lms
+```
+
+To stop it later:
+
+```bash
+docker stop devops-lms
+```
+
+---
+
+## Building for Production (without Docker)
+
+If you want to run the optimised production build directly with Node.js:
+
+```bash
+# Build the app
+npm run build
+
+# Start the production server
+npm start
+```
+
+The app will be available at [http://localhost:3000](http://localhost:3000). The production build is faster and uses less memory than the development server.
+
+---
+
+## Tech Stack
+
+| Technology | Purpose |
+|-----------|---------|
+| [Next.js](https://nextjs.org) | React framework (App Router) |
+| TypeScript | Type-safe JavaScript |
+| Tailwind CSS | Styling |
+| localStorage | All data storage — no database needed |
+| React Context | State management for profiles and progress |
+| Lucide React | Icons |
 
 ---
 
 ## Project Structure
 
 ```
-app/              # Next.js App Router pages
-components/       # Shared UI components
-lib/
-  content/        # All 20 learning tracks (TypeScript)
-  hooks/          # React hooks (useProfile, useProgress, useNotes)
-public/           # Static assets
+devops-lms/
+├── app/                  # Pages and routes (Next.js App Router)
+├── components/
+│   ├── layout/           # Sidebar, top nav, app shell
+│   ├── lesson/           # Lesson viewer, code blocks, quizzes
+│   └── ui/               # Reusable UI primitives (buttons, dialogs, etc.)
+├── lib/
+│   ├── content/          # All 20 learning tracks as TypeScript files
+│   └── hooks/            # React hooks (useProfile, useProgress, useNotes, useTheme)
+└── public/               # Static assets and screenshots
 ```
 
-## Adding Content
+---
 
-Each track is a TypeScript file in `lib/content/` that exports a `Track` object. To add a new track:
+## Adding a New Track
 
-1. Create `lib/content/my-track.ts` following the structure of any existing track
+Each learning track is a single TypeScript file. To add your own:
+
+1. Create `lib/content/my-topic.ts` — copy the structure from any existing file like `lib/content/linux.ts`
 2. Import and add it to the `tracks` array in `lib/content/index.ts`
-3. Add a CSS gradient class in `app/globals.css`
+3. Add a gradient colour class for the track card in `app/globals.css`
+
+---
+
+## Troubleshooting
+
+**`npm install` fails**
+Make sure you have Node.js v18 or higher. Run `node -v` to check. If the version is lower, download the latest LTS from [nodejs.org](https://nodejs.org).
+
+**Port 3000 is already in use**
+Another app is using port 3000. Either stop that app, or run the dev server on a different port:
+```bash
+npm run dev -- -p 3001
+```
+Then open [http://localhost:3001](http://localhost:3001).
+
+**Docker build fails with "Cannot connect to the Docker daemon"**
+Docker Desktop is not running. Open it from your Applications folder (Mac) or Start menu (Windows) and wait for it to fully start before running the build command again.
+
+**Changes I make to the code don't appear**
+Make sure the development server (`npm run dev`) is running. If it is, try refreshing the browser. If the issue persists, stop the server with `Ctrl + C` and start it again.
