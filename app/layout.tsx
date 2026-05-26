@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 import { ProfileProvider } from "@/lib/hooks/useProfile";
+import { ProgressProvider } from "@/lib/hooks/useProgress";
 import { ThemeProvider } from "@/lib/hooks/useTheme";
 
 const geistSans = Geist({
@@ -34,7 +35,9 @@ export default function RootLayout({
           }}
         />
         <ThemeProvider>
-          <ProfileProvider>{children}</ProfileProvider>
+          <ProfileProvider>
+            <ProgressProvider>{children}</ProgressProvider>
+          </ProfileProvider>
         </ThemeProvider>
       </body>
     </html>
